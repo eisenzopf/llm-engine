@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Once;
 use tracing::{Level};
 use tracing_subscriber::{
-    fmt::{format::FmtSpan, self},
+    fmt::{format::FmtSpan, self as fmt_subscriber},
     EnvFilter,
 };
 

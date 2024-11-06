@@ -236,13 +236,6 @@ pub struct EventTiming {
     pub data: HashMap<String, String>,
 }
 
-#[macro_export]
-macro_rules! profile_span {
-    ($name:expr) => {
-        let _guard = ::profile_span::Profiler::global().start_span($name);
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@
 #![warn(rustdoc::missing_doc_code_examples)]
 
 use std::fmt;
-use anyhow::Result;
+use anyhow::Result as AnyhowResult;
 use candle_core::Device;
 
 // Public modules

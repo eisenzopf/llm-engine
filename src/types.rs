@@ -1,8 +1,7 @@
 //! Common type definitions used throughout the engine
 
 use std::time::Duration;
-use serde::Serialize;
-se serde::Deserialize;
+use serde::{Serialize, Deserialize};
 
 /// Processing output from the model
 #[derive(Debug, Clone, Serialize, Deserialize)]
