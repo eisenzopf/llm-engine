@@ -1,113 +1,138 @@
-use std::sync::Arc;
 use anyhow::Result;
-use crate::{
-    config::EngineConfig,
-    error::EngineError,
-};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::llama::{Config, Llama, Cache};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use crate::error::EngineError;
+use crate::config::EngineConfig;
 
-use super::runtime::ModelRuntime;
-
-/// Handles model loading and initialization
 pub struct ModelLoader {
     config: Arc<EngineConfig>,
+    max_concurrent_loads: usize,
+    semaphore: Arc<Semaphore>,
 }
 
 impl ModelLoader {
-    /// Create a new model loader
     pub fn new(config: Arc<EngineConfig>) -> Self {
-        Self { config }
+        let max_concurrent_loads = config.gpu.device_ids.as_ref()
+            .map(|ids| ids.len())
+            .unwrap_or(1);
+            
+        Self {
+            config,
+            max_concurrent_loads,
+            semaphore: Arc::new(Semaphore::new(max_concurrent_loads)),
+        }
     }
 
-    /// Load a model for the specified device
-    pub async fn load_model(&self, device_id: usize) -> Result<ModelRuntime> {
-        let model_path = &self.config.model.model_path;
+    pub async fn load_models(
+        &self,
+        model_paths: Vec<Vec<PathBuf>>,
+        devices: Vec<Device>,
+    ) -> Result<Vec<Arc<Llama>>> {
+        let mut handles = Vec::new();
         
-        // Ensure model files exist
-        if !model_path.exists() {
+        for (device_id, (paths, device)) in model_paths.iter()
+            .zip(devices.iter())
+            .enumerate() 
+        {
+            let paths = paths.clone();
+            let device = device.clone();
+            let semaphore = Arc::clone(&self.semaphore);
+            let config = self.config.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                
+                // Load the model configuration
+                let llama_config = config.model.to_llama_config(
+                    config.gpu.flash_attention
+                );
+
+                // Create the variable builder with proper dtype
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(
+                        &paths,
+                        DType::BF16,
+                        &device
+                    )?
+                };
+
+                // Initialize model
+                let model = Llama::load(vb, &llama_config)
+                    .map_err(|e| EngineError::ModelError {
+                        message: format!("Failed to load model on device {}: {}", device_id, e),
+                        source: Some(Box::new(e)),
+                    })?;
+
+                Ok::<Arc<Llama>, EngineError>(Arc::new(model))
+            });
+
+            handles.push(handle);
+        }
+
+        let mut models = Vec::new();
+        for handle in handles {
+            match handle.await? {
+                Ok(model) => models.push(model),
+                Err(e) => {
+                    // Clean up already loaded models
+                    models.clear();
+                    return Err(e.into());
+                }
+            }
+        }
+
+        if models.is_empty() {
             return Err(EngineError::InitializationError {
-                message: format!("Model path does not exist: {}", model_path.display()),
+                message: "No models were successfully loaded".to_string(),
                 source: None,
             }.into());
         }
 
-        // Load configuration
-        let config_path = model_path.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path).map_err(|e| {
-            EngineError::InitializationError {
-                message: format!("Failed to read config.json: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?;
-
-        // Parse model configuration
-        let model_config: serde_json::Value = serde_json::from_str(&config_str).map_err(|e| {
-            EngineError::InitializationError {
-                message: format!("Failed to parse config.json: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?;
-
-        // Initialize candle device
-        let device = candle_core::Device::cuda_if_available(device_id).map_err(|e| {
-            EngineError::GPUError {
-                device_id,
-                message: format!("Failed to initialize CUDA device: {}", e),
-                recoverable: false,
-            }
-        })?;
-
-        // Load model weights
-        let weights_path = model_path.join("model.safetensors");
-        let weights = unsafe {
-            candle_core::safetensors::load(&weights_path, &device).map_err(|e| {
-                EngineError::InitializationError {
-                    message: format!("Failed to load model weights: {}", e),
-                    source: Some(Box::new(e)),
-                }
-            })?
-        };
-
-        // Create model runtime
-        ModelRuntime::new(
-            device_id,
-            device,
-            weights,
-            model_config,
-            self.config.clone(),
-        )
+        Ok(models)
     }
 
-    /// Check if model files are available
-    pub async fn check_model_files(&self) -> Result<bool> {
-        let model_path = &self.config.model.model_path;
-        
-        if !model_path.exists() {
-            return Ok(false);
-        }
+    pub fn create_cache(&self, device: &Device) -> Result<Cache> {
+        Cache::new(
+            self.config.gpu.flash_attention,
+            DType::BF16,
+            &self.config.model.to_llama_config(self.config.gpu.flash_attention),
+            device,
+        ).map_err(|e| EngineError::InitializationError {
+            message: format!("Failed to create cache: {}", e),
+            source: Some(Box::new(e)),
+        }.into())
+    }
+}
 
-        let required_files = [
-            "config.json",
-            "model.safetensors",
-            "tokenizer.json",
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn test_model_loading() -> Result<()> {
+        let config = Arc::new(EngineConfig::default());
+        let loader = ModelLoader::new(config);
+
+        let device = Device::Cpu;
+        let model_path = Path::new("test_models/meta-llama/Llama-3.1-8B-Instruct");
+        
+        let paths = vec![
+            model_path.join("model-00001-of-00003.safetensors"),
+            model_path.join("model-00002-of-00003.safetensors"),
+            model_path.join("model-00003-of-00003.safetensors"),
         ];
 
-        for file in required_files {
-            if !model_path.join(file).exists() {
-                return Ok(false);
-            }
-        }
+        let models = loader.load_models(
+            vec![paths],
+            vec![device]
+        ).await?;
 
-        Ok(true)
+        assert_eq!(models.len(), 1);
+        Ok(())
     }
-
-    /// Get model metadata
-    pub async fn get_model_metadata(&self) -> Result<ModelMetadata> {
-        let config_path = self.config.model.model_path.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path).map_err(|e| {
-            EngineError::InitializationError {
-                message: format!("Failed to read config.json: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?;
-
-        let
+}

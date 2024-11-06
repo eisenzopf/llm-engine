@@ -1,44 +1,56 @@
+// Location: src/processing/stream.rs
+
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
 use crate::{
+    config::EngineConfig,
     error::{EngineError, Result},
-    model::ModelRuntime,
+    model::{ModelRuntime, LlamaTokenizer},
     metrics::MetricsCollector,
     types::ProcessingOutput,
 };
 
-use super::common::{ProcessingStats, ProcessingResult};
-use super::Processor;
-
 /// Handles streaming mode processing
 pub struct StreamProcessor {
     runtime: Arc<ModelRuntime>,
+    tokenizer: Arc<LlamaTokenizer>,
     metrics: Arc<Mutex<MetricsCollector>>,
     active_streams: Arc<Mutex<Vec<StreamState>>>,
+    config: Arc<EngineConfig>,
 }
 
 /// State for an active stream
+#[derive(Debug)]
 struct StreamState {
     id: usize,
     created_at: std::time::Instant,
     processed_tokens: usize,
+    current_context: Vec<u32>,
+    device_id: usize,
 }
 
 impl StreamProcessor {
     /// Create a new stream processor
-    pub fn new(runtime: Arc<ModelRuntime>, metrics: Arc<Mutex<MetricsCollector>>) -> Self {
+    pub fn new(
+        runtime: Arc<ModelRuntime>,
+        tokenizer: Arc<LlamaTokenizer>,
+        metrics: Arc<Mutex<MetricsCollector>>,
+        config: Arc<EngineConfig>,
+    ) -> Self {
         Self {
             runtime,
+            tokenizer,
             metrics,
             active_streams: Arc::new(Mutex::new(Vec::new())),
+            config,
         }
     }
 
     /// Create a new stream handle
     pub async fn create_handle(&self) -> Result<StreamHandle> {
-        let (input_tx, input_rx) = mpsc::channel(100);
+        let (input_tx, input_rx) = mpsc::channel(self.config.processing.concurrency);
         let (output_tx, output_rx) = mpsc::channel(100);
 
         let stream_id = {
@@ -48,23 +60,29 @@ impl StreamProcessor {
                 id,
                 created_at: std::time::Instant::now(),
                 processed_tokens: 0,
+                current_context: Vec::new(),
+                device_id: self.runtime.device_index(),
             });
             id
         };
 
         // Spawn processing task
         let runtime = self.runtime.clone();
+        let tokenizer = self.tokenizer.clone();
         let metrics = self.metrics.clone();
         let active_streams = self.active_streams.clone();
+        let config = self.config.clone();
 
         tokio::spawn(async move {
             Self::process_stream(
                 stream_id,
                 runtime,
+                tokenizer,
                 input_rx,
                 output_tx,
                 metrics,
                 active_streams,
+                config,
             ).await;
         });
 
@@ -75,45 +93,94 @@ impl StreamProcessor {
     async fn process_stream(
         stream_id: usize,
         runtime: Arc<ModelRuntime>,
+        tokenizer: Arc<LlamaTokenizer>,
         mut input_rx: mpsc::Receiver<String>,
         output_tx: mpsc::Sender<ProcessingOutput>,
         metrics: Arc<Mutex<MetricsCollector>>,
         active_streams: Arc<Mutex<Vec<StreamState>>>,
+        config: Arc<EngineConfig>,
     ) {
         debug!("Starting stream processor {}", stream_id);
 
         while let Some(input) = input_rx.recv().await {
             let start_time = std::time::Instant::now();
             
-            match runtime.process(input).await {
+            // Get current state
+            let mut streams = active_streams.lock().await;
+            let state = streams.iter_mut().find(|s| s.id == stream_id)
+                .expect("Stream state not found");
+
+            // Add instruction template if configured
+            let input = if !input.starts_with("### Instruction:") {
+                config.generation.instruction_template.replace("{}", &input)
+            } else {
+                input
+            };
+
+            // Tokenize input
+            let mut input_tokens = match tokenizer.encode(&input, true).await {
+                Ok(tokens) => tokens,
+                Err(e) => {
+                    warn!("Tokenization error on stream {}: {:?}", stream_id, e);
+                    if output_tx.send(ProcessingOutput::error(e)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Add context from previous interaction if any
+            if !state.current_context.is_empty() {
+                let context_size = config.model.max_sequence_length / 4;
+                input_tokens.splice(
+                    0..0, 
+                    state.current_context.iter()
+                        .rev()
+                        .take(context_size)
+                        .rev()
+                        .cloned()
+                );
+            }
+
+            // Ensure we don't exceed maximum sequence length
+            if input_tokens.len() > config.model.max_sequence_length {
+                let truncate_len = input_tokens.len() - config.model.max_sequence_length;
+                input_tokens.drain(0..truncate_len);
+            }
+
+            // Process through model
+            match runtime.process_with_tokens(&input_tokens).await {
                 Ok(output) => {
+                    // Update state
+                    state.processed_tokens += output.tokens.len();
+                    state.current_context.extend(&output.tokens);
+
+                    // Trim context if needed
+                    if state.current_context.len() > config.model.max_sequence_length {
+                        let excess = state.current_context.len() - config.model.max_sequence_length;
+                        state.current_context.drain(0..excess);
+                    }
+
                     // Update metrics
                     {
                         let mut metrics = metrics.lock().await;
-                        metrics.record_processing(
+                        metrics.record_stream_processing(
                             stream_id,
                             output.tokens.len(),
                             start_time.elapsed(),
                         ).await;
                     }
 
-                    // Update stream state
-                    {
-                        let mut streams = active_streams.lock().await;
-                        if let Some(stream) = streams.get_mut(stream_id) {
-                            stream.processed_tokens += output.tokens.len();
-                        }
-                    }
-
                     // Send output
                     if output_tx.send(output).await.is_err() {
-                        warn!("Failed to send output for stream {}", stream_id);
                         break;
                     }
                 }
                 Err(e) => {
                     warn!("Processing error on stream {}: {:?}", stream_id, e);
-                    // Continue processing despite errors
+                    if output_tx.send(ProcessingOutput::error(e)).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -126,31 +193,40 @@ impl StreamProcessor {
             streams.remove(index);
         }
     }
-}
 
-#[async_trait::async_trait]
-impl Processor for StreamProcessor {
-    async fn shutdown(&self) -> Result<()> {
-        // Wait for all streams to complete
+    /// Get the current number of active streams
+    pub async fn active_stream_count(&self) -> usize {
+        self.active_streams.lock().await.len()
+    }
+
+    /// Get statistics for all active streams
+    pub async fn get_stream_stats(&self) -> Vec<StreamStats> {
+        let streams = self.active_streams.lock().await;
+        streams.iter().map(|state| StreamStats {
+            stream_id: state.id,
+            uptime: state.created_at.elapsed(),
+            processed_tokens: state.processed_tokens,
+            device_id: state.device_id,
+            context_tokens: state.current_context.len(),
+        }).collect()
+    }
+
+    /// Shutdown all streams
+    pub async fn shutdown(&self) -> Result<()> {
         let mut streams = self.active_streams.lock().await;
         streams.clear();
         Ok(())
     }
+}
 
-    async fn get_stats(&self) -> ProcessingStats {
-        let streams = self.active_streams.lock().await;
-        
-        ProcessingStats {
-            active_streams: streams.len(),
-            total_processed_tokens: streams.iter()
-                .map(|s| s.processed_tokens)
-                .sum(),
-            uptime: streams.iter()
-                .map(|s| s.created_at.elapsed())
-                .max()
-                .unwrap_or_default(),
-        }
-    }
+/// Statistics for a single stream
+#[derive(Debug, Clone)]
+pub struct StreamStats {
+    pub stream_id: usize,
+    pub uptime: std::time::Duration,
+    pub processed_tokens: usize,
+    pub device_id: usize,
+    pub context_tokens: usize,
 }
 
 /// Handle for interacting with a stream
@@ -183,18 +259,24 @@ impl StreamHandle {
     /// Process input and get output
     pub async fn process(&mut self, input: String) -> Result<ProcessingOutput> {
         self.input_tx.send(input).await.map_err(|_| {
-            EngineError::ProcessingError {
+            EngineError::StreamError {
+                stream_id: self.id,
                 message: "Stream closed".to_string(),
-                source: None,
             }
         })?;
 
         self.output_rx.recv().await.ok_or_else(|| {
-            EngineError::ProcessingError {
+            EngineError::StreamError {
+                stream_id: self.id,
                 message: "Stream closed".to_string(),
-                source: None,
             }
-        })
+        })?
+    }
+
+    /// Close the stream
+    pub async fn close(self) -> Result<()> {
+        // Dropping self will close the channels
+        Ok(())
     }
 }
 
@@ -203,14 +285,20 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    async fn create_test_processor() -> (StreamProcessor, Arc<TestRuntime>) {
+    async fn create_test_processor() -> Result<(StreamProcessor, Arc<TestRuntime>)> {
         let runtime = Arc::new(TestRuntime::default());
-        let metrics = Arc::new(Mutex::new(MetricsCollector::new(
-            Arc::new(crate::config::EngineConfig::default())
-        )));
+        let tokenizer = Arc::new(LlamaTokenizer::from_file("models/tokenizer.json").await?);
+        let metrics = Arc::new(Mutex::new(MetricsCollector::new(Arc::new(EngineConfig::default()))));
+        let config = Arc::new(EngineConfig::default());
         
-        let processor = StreamProcessor::new(runtime.clone(), metrics);
-        (processor, runtime)
+        let processor = StreamProcessor::new(
+            runtime.clone(),
+            tokenizer,
+            metrics,
+            config,
+        );
+
+        Ok((processor, runtime))
     }
 
     #[derive(Default)]
@@ -220,13 +308,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelRuntime for TestRuntime {
-        async fn process(&self, input: String) -> Result<ProcessingOutput> {
+        async fn process_with_tokens(&self, tokens: &[u32]) -> Result<ProcessingOutput> {
             let mut processed = self.processed.lock().await;
             *processed += 1;
             
             Ok(ProcessingOutput {
-                text: format!("Processed: {}", input),
-                tokens: vec![],
+                text: "Test output".to_string(),
+                tokens: tokens.to_vec(),
                 processing_time: Duration::from_millis(100),
             })
         }
@@ -234,49 +322,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_processing() -> Result<()> {
-        let (processor, runtime) = create_test_processor().await;
+        let (processor, runtime) = create_test_processor().await?;
         
         let mut handle = processor.create_handle().await?;
         
         // Process some inputs
-        let output = handle.process("test 1".to_string()).await?;
-        assert!(output.text.contains("test 1"));
+        let output = handle.process("Test input".to_string()).await?;
+        assert!(!output.text.is_empty());
+        assert!(!output.tokens.is_empty());
         
-        let output = handle.process("test 2".to_string()).await?;
-        assert!(output.text.contains("test 2"));
-        
-        // Verify runtime was called
         let processed = runtime.processed.lock().await;
-        assert_eq!(*processed, 2);
+        assert_eq!(*processed, 1);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_multiple_streams() -> Result<()> {
-        let (processor, _) = create_test_processor().await;
+    async fn test_stream_context() -> Result<()> {
+        let (processor, _) = create_test_processor().await?;
         
-        let mut handles = vec![];
-        for _ in 0..3 {
-            handles.push(processor.create_handle().await?);
-        }
+        let mut handle = processor.create_handle().await?;
         
-        let stats = processor.get_stats().await;
-        assert_eq!(stats.active_streams, 3);
-
+        // Process multiple messages
+        handle.process("First message".to_string()).await?;
+        let output = handle.process("Second message".to_string()).await?;
+        
+        // Check that context was maintained
+        let stats = processor.get_stream_stats().await;
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].context_tokens > 0);
+        
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_stream_shutdown() -> Result<()> {
-        let (processor, _) = create_test_processor().await;
+    async fn test_stream_cleanup() -> Result<()> {
+        let (processor, _) = create_test_processor().await?;
         
-        let _handle = processor.create_handle().await?;
-        processor.shutdown().await?;
+        let handle = processor.create_handle().await?;
+        assert_eq!(processor.active_stream_count().await, 1);
         
-        let stats = processor.get_stats().await;
-        assert_eq!(stats.active_streams, 0);
-
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(processor.active_stream_count().await, 0);
+        
         Ok(())
     }
 }

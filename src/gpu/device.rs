@@ -1,7 +1,10 @@
+// Location: src/gpu/device.rs
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use anyhow::Result;
+use candle_core::{Device, DType, Tensor};
 
 use crate::error::EngineError;
 use crate::metrics::MetricsCollector;
@@ -10,14 +13,14 @@ use crate::metrics::MetricsCollector;
 pub struct GpuDevice {
     /// Device index
     index: usize,
-    /// CUDA device handle
-    device: candle_core::Device,
+    /// Candle device handle
+    device: Device,
     /// Memory tracking
     memory: Arc<Mutex<DeviceMemory>>,
     /// Performance metrics
     metrics: Arc<Mutex<DeviceMetrics>>,
-    /// Configuration
-    config: Arc<crate::config::GpuConfig>,
+    /// Device capabilities
+    capabilities: DeviceCapabilities,
 }
 
 /// Tracks GPU memory usage
@@ -33,6 +36,36 @@ struct DeviceMemory {
     allocations: Vec<MemoryAllocation>,
     /// Last garbage collection
     last_gc: Instant,
+    /// Memory pool for tensor recycling
+    tensor_pool: TensorPool,
+}
+
+/// Device capabilities and limits
+#[derive(Debug, Clone)]
+pub struct DeviceCapabilities {
+    /// Maximum batch size
+    pub max_batch_size: usize,
+    /// Maximum sequence length
+    pub max_sequence_length: usize,
+    /// Whether flash attention is supported
+    pub supports_flash_attention: bool,
+    /// Available compute capability
+    pub compute_capability: (i32, i32),
+    /// Memory bus width
+    pub memory_bus_width: i32,
+    /// Maximum shared memory per block
+    pub max_shared_memory: usize,
+}
+
+/// Pool for recycling tensor allocations
+#[derive(Debug, Default)]
+struct TensorPool {
+    /// Pooled tensors by shape
+    tensors: HashMap<Vec<usize>, Vec<Tensor>>,
+    /// Total memory used by pool
+    total_bytes: u64,
+    /// Maximum pool size
+    max_pool_bytes: u64,
 }
 
 /// Represents a single memory allocation
@@ -44,6 +77,8 @@ struct MemoryAllocation {
     timestamp: Instant,
     /// What the allocation is for
     purpose: String,
+    /// Stack trace of allocation
+    stack_trace: String,
 }
 
 /// Device performance metrics
@@ -78,35 +113,23 @@ impl GpuDevice {
     /// Create a new GPU device
     pub async fn new(
         index: usize,
-        config: Arc<crate::config::GpuConfig>,
+        device: Device,
         metrics_collector: Arc<Mutex<MetricsCollector>>,
     ) -> Result<Self> {
-        // Initialize CUDA device
-        let device = candle_core::Device::cuda_if_available(index)
-            .map_err(|e| EngineError::GPUError {
-                device_id: index,
-                message: format!("Failed to initialize CUDA device: {}", e),
-                recoverable: false,
-            })?;
-
-        // Get device properties
-        let (total_memory, _) = unsafe {
-            cuda_runtime_sys::cudaMemGetInfo(
-                &mut 0 as *mut usize,
-                &mut 0 as *mut usize,
-            )
-        }.map_err(|e| EngineError::GPUError {
-            device_id: index,
-            message: format!("Failed to get device memory info: {}", e),
-            recoverable: false,
-        })?;
-
+        let capabilities = Self::detect_capabilities(&device)?;
+        let total_memory = Self::get_total_memory(&device)?;
+        
         let memory = DeviceMemory {
-            total_bytes: total_memory as u64,
+            total_bytes: total_memory,
             allocated_bytes: 0,
             peak_bytes: 0,
             allocations: Vec::new(),
             last_gc: Instant::now(),
+            tensor_pool: TensorPool {
+                tensors: HashMap::new(),
+                total_bytes: 0,
+                max_pool_bytes: total_memory / 4, // Use up to 25% for pool
+            },
         };
 
         Ok(Self {
@@ -114,74 +137,123 @@ impl GpuDevice {
             device,
             memory: Arc::new(Mutex::new(memory)),
             metrics: Arc::new(Mutex::new(DeviceMetrics::default())),
-            config,
+            capabilities,
         })
     }
 
-    /// Allocate memory on the device
-    pub async fn allocate_memory(
+    /// Detect device capabilities
+    fn detect_capabilities(device: &Device) -> Result<DeviceCapabilities> {
+        match device {
+            Device::Cuda(cuda_dev) => {
+                let (major, minor) = unsafe {
+                    let mut major = 0;
+                    let mut minor = 0;
+                    candle_core::cuda_backend::cuda::cuDeviceGetAttribute(
+                        &mut major,
+                        candle_core::cuda_backend::cuda::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                        cuda_dev.ordinal() as i32,
+                    )?;
+                    candle_core::cuda_backend::cuda::cuDeviceGetAttribute(
+                        &mut minor,
+                        candle_core::cuda_backend::cuda::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                        cuda_dev.ordinal() as i32,
+                    )?;
+                    (major, minor)
+                };
+
+                Ok(DeviceCapabilities {
+                    max_batch_size: 32,
+                    max_sequence_length: 32768,
+                    supports_flash_attention: major >= 8,
+                    compute_capability: (major, minor),
+                    memory_bus_width: 384,  // Default for modern GPUs
+                    max_shared_memory: 48 * 1024,  // 48KB default
+                })
+            }
+            Device::Cpu => Ok(DeviceCapabilities {
+                max_batch_size: 8,
+                max_sequence_length: 32768,
+                supports_flash_attention: false,
+                compute_capability: (0, 0),
+                memory_bus_width: 0,
+                max_shared_memory: 0,
+            }),
+            _ => Err(EngineError::DeviceError {
+                message: "Unsupported device type".to_string(),
+            }.into()),
+        }
+    }
+
+    /// Allocate a new tensor with optional pooling
+    pub async fn allocate_tensor<T: candle_core::WithDType>(
         &self,
-        size: u64,
-        purpose: &str,
-    ) -> Result<DeviceAllocation> {
-        let mut memory = self.memory.lock().await;
+        shape: &[usize],
+        data: &[T],
+        pool_key: Option<String>,
+    ) -> Result<Tensor> {
+        let size = data.len() * std::mem::size_of::<T>();
         
-        // Check if we need to run garbage collection
-        if memory.should_gc(&self.config) {
-            self.force_gc().await?;
-            memory = self.memory.lock().await;
+        // Try to get from pool first
+        if let Some(key) = pool_key {
+            let mut memory = self.memory.lock().await;
+            if let Some(tensor) = memory.tensor_pool.get(shape) {
+                return Ok(tensor);
+            }
         }
 
-        // Check if we have enough memory
-        let available = memory.total_bytes - memory.allocated_bytes;
-        if size > available {
-            return Err(EngineError::ResourceError {
-                message: format!(
-                    "Not enough GPU memory. Requested: {}GB, Available: {}GB",
-                    size as f64 / 1024.0 / 1024.0 / 1024.0,
-                    available as f64 / 1024.0 / 1024.0 / 1024.0
-                ),
-                resource_type: crate::error::ResourceType::Memory,
-            }.into());
-        }
-
+        // Allocate new tensor
+        let tensor = Tensor::new(data, &self.device)?;
+        
         // Track allocation
-        memory.allocated_bytes += size;
+        let mut memory = self.memory.lock().await;
+        memory.allocated_bytes += size as u64;
         memory.peak_bytes = memory.peak_bytes.max(memory.allocated_bytes);
+        
         memory.allocations.push(MemoryAllocation {
-            size,
+            size: size as u64,
             timestamp: Instant::now(),
-            purpose: purpose.to_string(),
+            purpose: pool_key.unwrap_or_else(|| "unknown".to_string()),
+            stack_trace: std::backtrace::Backtrace::force_capture().to_string(),
         });
 
-        Ok(DeviceAllocation::new(self.clone(), size))
+        Ok(tensor)
+    }
+
+    /// Release a tensor back to the pool
+    pub async fn release_tensor(&self, tensor: Tensor, pool_key: Option<String>) -> Result<()> {
+        if let Some(key) = pool_key {
+            let mut memory = self.memory.lock().await;
+            memory.tensor_pool.add(tensor, &key)?;
+        }
+        Ok(())
     }
 
     /// Force garbage collection
     pub async fn force_gc(&self) -> Result<()> {
         let mut memory = self.memory.lock().await;
         
+        // Clear tensor pool
+        memory.tensor_pool.clear();
+        
         // Synchronize device
-        unsafe {
-            cuda_runtime_sys::cudaDeviceSynchronize();
+        if let Device::Cuda(_) = self.device {
+            unsafe {
+                candle_core::cuda_backend::cuda::cuStreamSynchronize(0)?;
+                candle_core::cuda_backend::cuda::cuMemGetInfo(
+                    &mut 0 as *mut usize,
+                    &mut 0 as *mut usize,
+                )?;
+            }
         }
 
-        // Clear CUDA cache
-        unsafe {
-            cuda_runtime_sys::cudaMemGetInfo(
-                &mut 0 as *mut usize,
-                &mut 0 as *mut usize,
-            )?;
-        }
-
-        memory.last_gc = Instant::now();
         memory.allocated_bytes = 0;
         memory.allocations.clear();
+        memory.last_gc = Instant::now();
 
         Ok(())
     }
 
-    /// Record an operation timing
+    /// Record operation timing
     pub async fn record_timing(
         &self,
         operation: &str,
@@ -196,61 +268,12 @@ impl GpuDevice {
             timestamp: Instant::now(),
         });
 
-        // Keep timing history bounded
         if metrics.timings.len() > 1000 {
             metrics.timings.remove(0);
         }
     }
 
-    /// Update device metrics
-    pub async fn update_metrics(&self) -> Result<()> {
-        let mut metrics = self.metrics.lock().await;
-
-        // Get compute utilization
-        let mut utilization = 0u32;
-        unsafe {
-            cuda_runtime_sys::cudaDeviceGetAttribute(
-                &mut utilization as *mut u32,
-                cuda_runtime_sys::cudaDeviceAttr_t_cudaDevAttrComputeCapabilityMajor,
-                self.index as i32,
-            )?;
-        }
-        metrics.compute_utilization = utilization as f32;
-
-        // Get temperature
-        let mut temp = 0i32;
-        unsafe {
-            cuda_runtime_sys::cudaDeviceGetTemperature(
-                &mut temp as *mut i32,
-                self.index as i32,
-            )?;
-        }
-        metrics.temperature = temp as f32;
-
-        // Get power usage
-        let mut power = 0f32;
-        unsafe {
-            cuda_runtime_sys::cudaDeviceGetPowerUsage(
-                &mut power as *mut f32,
-                self.index as i32,
-            )?;
-        }
-        metrics.power_usage = power;
-
-        Ok(())
-    }
-
-    /// Get current memory usage in bytes
-    pub async fn memory_used(&self) -> u64 {
-        self.memory.lock().await.allocated_bytes
-    }
-
-    /// Get peak memory usage in bytes
-    pub async fn peak_memory(&self) -> u64 {
-        self.memory.lock().await.peak_bytes
-    }
-
-    /// Get device metrics
+    /// Get current metrics
     pub async fn get_metrics(&self) -> DeviceMetricsSnapshot {
         let metrics = self.metrics.lock().await;
         let memory = self.memory.lock().await;
@@ -260,93 +283,95 @@ impl GpuDevice {
             memory_bandwidth: metrics.memory_bandwidth,
             temperature: metrics.temperature,
             power_usage: metrics.power_usage,
-            memory_used: memory.allocated_bytes,
+            allocated_memory: memory.allocated_bytes,
             peak_memory: memory.peak_bytes,
-            total_memory: memory.total_bytes,
+            pool_memory: memory.tensor_pool.total_bytes,
         }
     }
 }
 
-impl DeviceMemory {
-    /// Check if garbage collection is needed
-    fn should_gc(&self, config: &crate::config::GpuConfig) -> bool {
-        let memory_pressure = self.allocated_bytes as f64 / self.total_bytes as f64;
-        let time_since_gc = self.last_gc.elapsed();
-
-        memory_pressure > config.memory_cleanup_threshold ||
-            time_since_gc > Duration::from_secs(60)
+impl TensorPool {
+    /// Get a tensor from the pool
+    fn get(&mut self, shape: &[usize]) -> Option<Tensor> {
+        self.tensors.get_mut(shape)?.pop()
     }
-}
 
-/// Represents a memory allocation on the device
-pub struct DeviceAllocation {
-    device: GpuDevice,
-    size: u64,
-}
-
-impl DeviceAllocation {
-    fn new(device: GpuDevice, size: u64) -> Self {
-        Self { device, size }
-    }
-}
-
-impl Drop for DeviceAllocation {
-    fn drop(&mut self) {
-        // Queue memory deallocation
-        let device = self.device.clone();
-        let size = self.size;
-        tokio::spawn(async move {
-            if let Ok(mut memory) = device.memory.try_lock() {
-                memory.allocated_bytes = memory.allocated_bytes.saturating_sub(size);
+    /// Add a tensor to the pool
+    fn add(&mut self, tensor: Tensor, key: &str) -> Result<()> {
+        let shape = tensor.dims().to_vec();
+        let size = tensor.elem_size()? * shape.iter().product::<usize>() as u64;
+        
+        // Check if adding would exceed pool limit
+        if self.total_bytes + size > self.max_pool_bytes {
+            // Remove oldest tensors until we have space
+            for tensors in self.tensors.values_mut() {
+                while !tensors.is_empty() && self.total_bytes + size > self.max_pool_bytes {
+                    tensors.remove(0);
+                    self.total_bytes -= size;
+                }
             }
-        });
+        }
+
+        self.tensors.entry(shape).or_default().push(tensor);
+        self.total_bytes += size;
+        Ok(())
+    }
+
+    /// Clear the pool
+    fn clear(&mut self) {
+        self.tensors.clear();
+        self.total_bytes = 0;
     }
 }
 
-/// Snapshot of device metrics
 #[derive(Debug, Clone)]
 pub struct DeviceMetricsSnapshot {
     pub compute_utilization: f32,
     pub memory_bandwidth: f32,
     pub temperature: f32,
     pub power_usage: f32,
-    pub memory_used: u64,
+    pub allocated_memory: u64,
     pub peak_memory: u64,
-    pub total_memory: u64,
+    pub pool_memory: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     async fn create_test_device() -> Result<GpuDevice> {
-        let config = Arc::new(crate::config::GpuConfig {
-            memory_threshold: 0.9,
-            memory_cleanup_threshold: 0.8,
-            ..Default::default()
-        });
-
-        let metrics = Arc::new(Mutex::new(MetricsCollector::new(
-            Arc::new(crate::config::EngineConfig::default())
-        )));
-
-        GpuDevice::new(0, config, metrics).await
+        let metrics = Arc::new(Mutex::new(MetricsCollector::default()));
+        GpuDevice::new(0, Device::Cpu, metrics).await
     }
 
     #[tokio::test]
-    async fn test_memory_allocation() -> Result<()> {
+    async fn test_tensor_allocation() -> Result<()> {
         let device = create_test_device().await?;
         
-        // Allocate some memory
-        let allocation = device.allocate_memory(1024 * 1024, "test").await?;
-        assert_eq!(device.memory_used().await, 1024 * 1024);
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor = device.allocate_tensor(&[2, 2], &data, Some("test".to_string())).await?;
         
-        // Free memory
-        drop(allocation);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(device.memory_used().await, 0);
+        assert_eq!(tensor.dims(), &[2, 2]);
+        
+        let metrics = device.get_metrics().await;
+        assert!(metrics.allocated_memory > 0);
+        
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn test_tensor_pool() -> Result<()> {
+        let device = create_test_device().await?;
+        
+        // Allocate and release to pool
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor = device.allocate_tensor(&[2, 2], &data, Some("test".to_string())).await?;
+        device.release_tensor(tensor, Some("test".to_string())).await?;
+        
+        // Verify pool usage
+        let metrics = device.get_metrics().await;
+        assert!(metrics.pool_memory > 0);
+        
         Ok(())
     }
 
@@ -354,52 +379,20 @@ mod tests {
     async fn test_garbage_collection() -> Result<()> {
         let device = create_test_device().await?;
         
-        // Allocate memory
-        let _allocation = device.allocate_memory(1024 * 1024, "test").await?;
-        assert!(device.memory_used().await > 0);
+        // Allocate some tensors
+        let data: Vec<f32> = vec![1.0; 1000];
+        for _ in 0..10 {
+            let _ = device.allocate_tensor(&[100], &data, None).await?;
+        }
         
         // Force GC
         device.force_gc().await?;
-        assert_eq!(device.memory_used().await, 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metrics_recording() -> Result<()> {
-        let device = create_test_device().await?;
         
-        // Record some operations
-        device.record_timing("test_op", Duration::from_millis(100), 1024).await;
-        
+        // Verify memory was freed
         let metrics = device.get_metrics().await;
-        assert!(metrics.memory_used >= 0);
-        assert!(metrics.temperature >= 0.0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_memory_pressure() -> Result<()> {
-        let device = create_test_device().await?;
+        assert_eq!(metrics.allocated_memory, 0);
+        assert_eq!(metrics.pool_memory, 0);
         
-        // Try to allocate more than available
-        let total_memory = device.memory.lock().await.total_bytes;
-        let result = device.allocate_memory(total_memory * 2, "too_large").await;
-        
-        assert!(result.is_err());
-        match result {
-            Err(e) => {
-                match e.downcast_ref::<EngineError>() {
-                    Some(EngineError::ResourceError { resource_type, .. }) => {
-                        assert_eq!(*resource_type, crate::error::ResourceType::Memory);
-                    }
-                    _ => panic!("Expected ResourceError"),
-                }
-            }
-            _ => panic!("Expected error"),
-        }
-
         Ok(())
     }
 }

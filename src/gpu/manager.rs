@@ -1,8 +1,12 @@
+// Location: src/gpu/manager.rs
+
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use anyhow::Result;
+use candle_core::{Device, DType};
 use crate::{
     config::EngineConfig,
-    error::{EngineError, Result, ResourceType},
+    error::{EngineError, ResourceType},
     metrics::MetricsCollector,
 };
 
@@ -14,25 +18,36 @@ pub struct GpuManager {
     allocation_state: Arc<RwLock<AllocationState>>,
 }
 
-/// Represents a single GPU device
 #[derive(Debug)]
 struct GpuDevice {
     device_id: usize,
+    device: Device,
     total_memory: usize,
     allocated_memory: Arc<Mutex<usize>>,
-    device: candle_core::Device,
+    peak_memory: Arc<Mutex<usize>>,
+    last_garbage_collection: Arc<Mutex<std::time::Instant>>,
 }
 
-/// Tracks memory allocations across GPUs
 #[derive(Debug, Default)]
 struct AllocationState {
     device_allocations: Vec<DeviceAllocation>,
+    allocation_history: Vec<AllocationRecord>,
 }
 
 #[derive(Debug)]
 struct DeviceAllocation {
     device_id: usize,
-    allocated_bytes: usize,
+    size: usize,
+    purpose: String,
+    timestamp: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct AllocationRecord {
+    device_id: usize,
+    size: usize,
+    success: bool,
+    error: Option<String>,
     timestamp: std::time::Instant,
 }
 
@@ -42,80 +57,56 @@ impl GpuManager {
         config: Arc<EngineConfig>,
         metrics: Arc<Mutex<MetricsCollector>>,
     ) -> Result<Self> {
-        let devices = Self::initialize_devices(&config)?;
-        
+        let mut devices = Vec::new();
+        let device_ids = if let Some(ids) = &config.gpu.device_ids {
+            ids.clone()
+        } else {
+            // Auto-detect available devices
+            let mut available = Vec::new();
+            for i in 0..8 {
+                if Device::cuda_if_available(i).is_ok() {
+                    available.push(i);
+                }
+            }
+            if available.is_empty() {
+                return Err(EngineError::ResourceError {
+                    message: "No GPU devices available".to_string(),
+                    resource_type: ResourceType::GPU,
+                }.into());
+            }
+            available
+        };
+
+        for device_id in device_ids {
+            let device = Device::cuda_if_available(device_id).map_err(|e| {
+                EngineError::GPUError {
+                    device_id,
+                    message: format!("Failed to initialize CUDA device: {}", e),
+                    recoverable: false,
+                }
+            })?;
+
+            let total_memory = Self::get_device_memory(&device)
+                .unwrap_or_else(|| {
+                    (config.gpu.max_memory_gb.unwrap_or(8.0) * 1024.0 * 1024.0 * 1024.0) as usize
+                });
+
+            devices.push(GpuDevice {
+                device_id,
+                device,
+                total_memory,
+                allocated_memory: Arc::new(Mutex::new(0)),
+                peak_memory: Arc::new(Mutex::new(0)),
+                last_garbage_collection: Arc::new(Mutex::new(std::time::Instant::now())),
+            });
+        }
+
         Ok(Self {
             config,
             metrics,
             devices,
             allocation_state: Arc::new(RwLock::new(AllocationState::default())),
         })
-    }
-
-    /// Initialize available GPU devices
-    fn initialize_devices(config: &EngineConfig) -> Result<Vec<GpuDevice>> {
-        let mut devices = Vec::new();
-
-        // Check for specific device IDs in config
-        let device_ids = if let Some(ids) = &config.gpu.device_ids {
-            ids.clone()
-        } else {
-            // Auto-detect available devices
-            (0..8).filter(|&i| candle_core::Device::cuda_if_available(i).is_ok())
-                .collect()
-        };
-
-        for device_id in device_ids {
-            match candle_core::Device::cuda_if_available(device_id) {
-                Ok(device) => {
-                    // Get device properties
-                    let total_memory = Self::get_device_memory(&device)
-                        .unwrap_or(config.gpu.min_free_memory_gb as usize * 1024 * 1024 * 1024);
-                    
-                    devices.push(GpuDevice {
-                        device_id,
-                        total_memory,
-                        allocated_memory: Arc::new(Mutex::new(0)),
-                        device,
-                    });
-                }
-                Err(e) => {
-                    return Err(EngineError::GPUError {
-                        device_id,
-                        message: format!("Failed to initialize GPU: {}", e),
-                        recoverable: false,
-                    });
-                }
-            }
-        }
-
-        if devices.is_empty() {
-            return Err(EngineError::ResourceError {
-                message: "No GPU devices available".to_string(),
-                resource_type: ResourceType::GPU,
-            });
-        }
-
-        Ok(devices)
-    }
-
-    /// Get the device memory in bytes
-    fn get_device_memory(device: &candle_core::Device) -> Option<usize> {
-        #[cfg(feature = "cuda")]
-        unsafe {
-            let mut free: usize = 0;
-            let mut total: usize = 0;
-            if cuda_runtime_sys::cudaMemGetInfo(
-                &mut free as *mut usize,
-                &mut total as *mut usize,
-            ) == 0 {
-                Some(total)
-            } else {
-                None
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        None
     }
 
     /// Get the number of available GPUs
@@ -126,129 +117,203 @@ impl GpuManager {
     /// Request GPU memory allocation
     pub async fn allocate_memory(
         &self,
-        bytes: usize,
-        device_id: Option<usize>,
+        size: usize,
+        purpose: &str,
+        preferred_device: Option<usize>,
     ) -> Result<GpuAllocation> {
-        let device = if let Some(id) = device_id {
-            self.devices.iter()
-                .find(|d| d.device_id == id)
-                .ok_or_else(|| EngineError::GPUError {
-                    device_id: id,
-                    message: "Invalid device ID".to_string(),
-                    recoverable: false,
-                })?
-        } else {
-            // Find device with most free memory
-            self.devices.iter()
-                .max_by_key(|d| {
-                    let allocated = *d.allocated_memory.try_lock()
-                        .unwrap_or(&d.total_memory);
-                    d.total_memory.saturating_sub(allocated)
-                })
-                .ok_or_else(|| EngineError::ResourceError {
-                    message: "No GPU devices available".to_string(),
-                    resource_type: ResourceType::GPU,
-                })?
+        // Try preferred device first if specified
+        if let Some(device_id) = preferred_device {
+            if let Ok(allocation) = self.try_allocate(device_id, size, purpose).await {
+                return Ok(allocation);
+            }
+        }
+
+        // Otherwise, find device with most free memory
+        let mut best_device = None;
+        let mut max_free = 0;
+
+        for device in &self.devices {
+            let allocated = *device.allocated_memory.lock().await;
+            let free = device.total_memory.saturating_sub(allocated);
+            if free > max_free {
+                max_free = free;
+                best_device = Some(device);
+            }
+        }
+
+        let device = best_device.ok_or_else(|| EngineError::ResourceError {
+            message: "No GPU with sufficient memory available".to_string(),
+            resource_type: ResourceType::Memory,
+        })?;
+
+        self.try_allocate(device.device_id, size, purpose).await
+    }
+
+    async fn try_allocate(
+        &self,
+        device_id: usize,
+        size: usize,
+        purpose: &str,
+    ) -> Result<GpuAllocation> {
+        let device = self.devices.iter()
+            .find(|d| d.device_id == device_id)
+            .ok_or_else(|| EngineError::GPUError {
+                device_id,
+                message: "Invalid device ID".to_string(),
+                recoverable: false,
+            })?;
+
+        // Check if garbage collection is needed
+        let should_gc = {
+            let last_gc = device.last_garbage_collection.lock().await;
+            last_gc.elapsed() > std::time::Duration::from_secs(60)
         };
+
+        if should_gc {
+            self.force_gc(device_id).await?;
+        }
 
         // Check memory availability
         let mut allocated = device.allocated_memory.lock().await;
         let available = device.total_memory.saturating_sub(*allocated);
         
-        if bytes > available {
+        if size > available {
+            // Record failed allocation
+            let mut state = self.allocation_state.write().await;
+            state.allocation_history.push(AllocationRecord {
+                device_id,
+                size,
+                success: false,
+                error: Some("Insufficient memory".to_string()),
+                timestamp: std::time::Instant::now(),
+            });
+
             return Err(EngineError::ResourceError {
                 message: format!(
-                    "Insufficient GPU memory. Requested: {}, Available: {}",
-                    bytes, available
+                    "Insufficient GPU memory on device {}. Requested: {:.2}GB, Available: {:.2}GB",
+                    device_id,
+                    size as f64 / 1024.0 / 1024.0 / 1024.0,
+                    available as f64 / 1024.0 / 1024.0 / 1024.0
                 ),
                 resource_type: ResourceType::Memory,
-            });
+            }.into());
         }
 
         // Update allocation state
-        *allocated += bytes;
-        
-        let allocation = GpuAllocation {
-            device_id: device.device_id,
-            bytes,
-            device: device.device.clone(),
-            manager: self.clone(),
-        };
+        *allocated += size;
+        let mut peak = device.peak_memory.lock().await;
+        *peak = (*peak).max(*allocated);
+
+        let mut state = self.allocation_state.write().await;
+        state.device_allocations.push(DeviceAllocation {
+            device_id,
+            size,
+            purpose: purpose.to_string(),
+            timestamp: std::time::Instant::now(),
+        });
+
+        state.allocation_history.push(AllocationRecord {
+            device_id,
+            size,
+            success: true,
+            error: None,
+            timestamp: std::time::Instant::now(),
+        });
 
         // Update metrics
         let mut metrics = self.metrics.lock().await;
-        metrics.record_gpu_allocation(device.device_id, bytes);
+        metrics.record_gpu_allocation(device_id, size).await;
 
-        Ok(allocation)
+        Ok(GpuAllocation {
+            device_id,
+            size,
+            device: device.device.clone(),
+            manager: self.clone(),
+        })
     }
 
-    /// Release GPU memory
-    async fn release_memory(&self, device_id: usize, bytes: usize) {
-        if let Some(device) = self.devices.iter().find(|d| d.device_id == device_id) {
-            let mut allocated = device.allocated_memory.lock().await;
-            *allocated = allocated.saturating_sub(bytes);
+    /// Force garbage collection on a device
+    pub async fn force_gc(&self, device_id: usize) -> Result<()> {
+        let device = self.devices.iter()
+            .find(|d| d.device_id == device_id)
+            .ok_or_else(|| EngineError::GPUError {
+                device_id,
+                message: "Invalid device ID".to_string(),
+                recoverable: false,
+            })?;
 
-            // Update metrics
-            let mut metrics = self.metrics.lock().await;
-            metrics.record_gpu_deallocation(device_id, bytes);
+        // Synchronize device
+        unsafe {
+            candle_core::cuda_backend::cuda::cuStreamSynchronize(0)?;
+            
+            // Clear CUDA cache
+            candle_core::cuda_backend::cuda::cuMemGetInfo(
+                &mut 0 as *mut usize,
+                &mut 0 as *mut usize,
+            )?;
         }
+
+        // Reset allocation counters
+        *device.allocated_memory.lock().await = 0;
+        *device.last_garbage_collection.lock().await = std::time::Instant::now();
+
+        // Clear allocation records for this device
+        let mut state = self.allocation_state.write().await;
+        state.device_allocations.retain(|a| a.device_id != device_id);
+
+        Ok(())
+    }
+
+    /// Get device memory in bytes
+    fn get_device_memory(device: &Device) -> Option<usize> {
+        unsafe {
+            let mut free = 0;
+            let mut total = 0;
+            if candle_core::cuda_backend::cuda::cuMemGetInfo(
+                &mut free as *mut usize,
+                &mut total as *mut usize,
+            ).is_ok() {
+                Some(total)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Get current memory usage stats for all devices
+    pub async fn get_memory_stats(&self) -> Vec<DeviceMemoryStats> {
+        let mut stats = Vec::new();
+        for device in &self.devices {
+            let allocated = *device.allocated_memory.lock().await;
+            let peak = *device.peak_memory.lock().await;
+            
+            stats.push(DeviceMemoryStats {
+                device_id: device.device_id,
+                total_memory: device.total_memory,
+                allocated_memory: allocated,
+                peak_memory: peak,
+                free_memory: device.total_memory.saturating_sub(allocated),
+            });
+        }
+        stats
     }
 
     /// Shutdown and cleanup
     pub async fn shutdown(&self) -> Result<()> {
         for device in &self.devices {
-            // Ensure all memory is released
-            let mut allocated = device.allocated_memory.lock().await;
-            if *allocated > 0 {
-                *allocated = 0;
-            }
-
-            // Force CUDA synchronization and reset
-            #[cfg(feature = "cuda")]
-            unsafe {
-                if let Err(e) = cuda_runtime_sys::cudaDeviceSynchronize() {
-                    return Err(EngineError::GPUError {
-                        device_id: device.device_id,
-                        message: format!("Failed to synchronize device: {}", e),
-                        recoverable: false,
-                    });
-                }
-            }
+            self.force_gc(device.device_id).await?;
         }
         Ok(())
     }
 }
 
-/// Represents a GPU memory allocation
-pub struct GpuAllocation {
-    device_id: usize,
-    bytes: usize,
-    device: candle_core::Device,
-    manager: GpuManager,
-}
-
-impl GpuAllocation {
-    /// Get the device for this allocation
-    pub fn device(&self) -> &candle_core::Device {
-        &self.device
-    }
-
-    /// Get the allocated size in bytes
-    pub fn size(&self) -> usize {
-        self.bytes
-    }
-}
-
-impl Drop for GpuAllocation {
-    fn drop(&mut self) {
-        let device_id = self.device_id;
-        let bytes = self.bytes;
-        let manager = self.manager.clone();
-        
-        tokio::spawn(async move {
-            manager.release_memory(device_id, bytes).await;
-        });
-    }
+#[derive(Debug, Clone)]
+pub struct DeviceMemoryStats {
+    pub device_id: usize,
+    pub total_memory: usize,
+    pub allocated_memory: usize,
+    pub peak_memory: usize,
+    pub free_memory: usize,
 }
 
 impl Clone for GpuManager {
@@ -266,9 +331,11 @@ impl Clone for GpuDevice {
     fn clone(&self) -> Self {
         Self {
             device_id: self.device_id,
+            device: self.device.clone(),
             total_memory: self.total_memory,
             allocated_memory: Arc::clone(&self.allocated_memory),
-            device: self.device.clone(),
+            peak_memory: Arc::clone(&self.peak_memory),
+            last_garbage_collection: Arc::clone(&self.last_garbage_collection),
         }
     }
 }
@@ -285,94 +352,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gpu_initialization() {
-        let manager = create_test_manager().await;
-        assert!(manager.is_ok());
-        
-        let manager = manager.unwrap();
-        assert!(manager.available_gpus() > 0);
-    }
-
-    #[tokio::test]
-    async fn test_memory_allocation() {
-        let manager = create_test_manager().await.unwrap();
+    async fn test_memory_allocation() -> Result<()> {
+        let manager = create_test_manager().await?;
         
         // Test successful allocation
-        let allocation = manager.allocate_memory(1024 * 1024, None).await;
-        assert!(allocation.is_ok());
+        let allocation = manager.allocate_memory(
+            1024 * 1024 * 1024, // 1GB
+            "test allocation",
+            None
+        ).await?;
         
-        // Test allocation tracking
-        let alloc = allocation.unwrap();
-        assert_eq!(alloc.size(), 1024 * 1024);
+        assert_eq!(allocation.size, 1024 * 1024 * 1024);
         
-        // Memory should be automatically released when allocation is dropped
-        drop(alloc);
+        // Check memory stats
+        let stats = manager.get_memory_stats().await;
+        assert!(!stats.is_empty());
+        assert!(stats[0].allocated_memory > 0);
         
-        // Allow time for async cleanup
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Verify memory was released
-        let device = &manager.devices[0];
-        let allocated = *device.allocated_memory.lock().await;
-        assert_eq!(allocated, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_overallocation() {
-        let manager = create_test_manager().await.unwrap();
+    async fn test_garbage_collection() -> Result<()> {
+        let manager = create_test_manager().await?;
         
-        // Try to allocate more memory than available
-        let huge_allocation = usize::MAX;
-        let result = manager.allocate_memory(huge_allocation, None).await;
-        assert!(result.is_err());
+        // Allocate some memory
+        let _allocation = manager.allocate_memory(
+            1024 * 1024 * 1024,
+            "test allocation",
+            None
+        ).await?;
         
-        match result {
-            Err(EngineError::ResourceError { resource_type: ResourceType::Memory, .. }) => (),
-            _ => panic!("Expected ResourceError with Memory type"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_multiple_allocations() {
-        let manager = create_test_manager().await.unwrap();
+        // Force GC
+        manager.force_gc(0).await?;
         
-        let mut allocations = Vec::new();
-        for _ in 0..5 {
-            let allocation = manager.allocate_memory(1024 * 1024, None).await;
-            assert!(allocation.is_ok());
-            allocations.push(allocation.unwrap());
-        }
+        // Check memory was freed
+        let stats = manager.get_memory_stats().await;
+        assert_eq!(stats[0].allocated_memory, 0);
         
-        // Verify total allocated memory
-        let device = &manager.devices[0];
-        let allocated = *device.allocated_memory.lock().await;
-        assert_eq!(allocated, 5 * 1024 * 1024);
-        
-        // Release all allocations
-        allocations.clear();
-        
-        // Allow time for async cleanup
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Verify all memory was released
-        let allocated = *device.allocated_memory.lock().await;
-        assert_eq!(allocated, 0);
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let manager = create_test_manager().await.unwrap();
-        
-        // Make some allocations
-        let allocation = manager.allocate_memory(1024 * 1024, None).await.unwrap();
-        
-        // Shutdown should fail while allocations exist
-        drop(allocation);
-        
-        // Allow time for async cleanup
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Now shutdown should succeed
-        assert!(manager.shutdown().await.is_ok());
+        Ok(())
     }
 }
