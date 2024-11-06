@@ -5,7 +5,7 @@ use crate::{
     error::{EngineError, Result},
     gpu::GpuManager,
     model::ModelManager,
-    metrics::MetricsCollector,
+    metrics::{MetricsCollector, MetricsSnapshot}
     types::{ProcessingOutput, StreamHandle, QueueHandle},
 };
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use anyhow::Result;
+use async_trait::async_trait;
 
 mod stream;
 mod batch;
@@ -16,7 +17,7 @@ pub use common::{ProcessingStats, MemoryStats, TokenSequence, BatchTensors};
 
 use crate::{
     config::{EngineConfig, ProcessingMode},
-    error::EngineError,
+    error::{EngineError, Result},
     model::{ModelRuntime, LlamaTokenizer},
     metrics::MetricsCollector,
     types::ProcessingOutput,
@@ -63,6 +64,20 @@ pub struct ProcessingEngine {
     
     /// Tokenizer
     tokenizer: Arc<LlamaTokenizer>,
+}
+
+#[async_trait]
+impl Processor for BatchProcessor {
+    async fn get_stats(&self) -> ProcessingStats {
+        let stats = self.get_stats().await;
+        ProcessingStats {
+            total_sequences: stats.total_sequences,
+            total_tokens: stats.total_tokens,
+            total_time: stats.uptime,
+            tokens_per_second: stats.total_tokens as f32 / stats.uptime.as_secs_f32(),
+            memory_stats: Default::default(),
+        }
+    }
 }
 
 impl ProcessingEngine {

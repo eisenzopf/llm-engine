@@ -7,6 +7,8 @@
 #![warn(rustdoc::missing_doc_code_examples)]
 
 use std::fmt;
+use anyhow::Result;
+use candle_core::Device;
 
 // Public modules
 pub mod engine;
@@ -45,9 +47,15 @@ impl Features {
     pub fn detect() -> Self {
         #[cfg(feature = "cuda")]
         let (cuda, cuda_devices) = {
-            match unsafe { cuda_runtime_sys::cudaGetDeviceCount(&mut 0) } {
-                0 => (true, 1),  // At least one device available
-                _ => (false, 0), // No CUDA devices available
+            // Use candle's CUDA detection instead of cuda_runtime_sys
+            match Device::cuda_if_available(0) {
+                Ok(_) => {
+                    let count = (0..8)
+                        .filter(|&i| Device::cuda_if_available(i).is_ok())
+                        .count();
+                    (true, count)
+                }
+                Err(_) => (false, 0),
             }
         };
 

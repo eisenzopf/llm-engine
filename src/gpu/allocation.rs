@@ -24,7 +24,7 @@ impl GpuAllocation {
             device_id,
             size,
             allocated_at: Instant::now(),
-            metrics,
+            metrics.clone(),
         };
 
         // Record allocation in metrics

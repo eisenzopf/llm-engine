@@ -87,14 +87,27 @@ struct QueueWaitRecord {
     timestamp: Instant,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct PriorityStats {
     priority: Priority,
     total_jobs: usize,
     completed_jobs: usize,
     total_tokens: usize,
-    avg_wait_time: Duration,
+    average_wait_time: Duration,
     max_wait_time: Duration,
+}
+
+impl Default for PriorityStats {
+    fn default() -> Self {
+        Self {
+            priority: Priority::Medium, // Default priority
+            total_jobs: 0,
+            completed_jobs: 0,
+            total_tokens: 0,
+            average_wait_time: Duration::default(),
+            max_wait_time: Duration::default(),
+        }
+    }
 }
 
 impl QueueProcessor {
@@ -414,7 +427,7 @@ impl QueueHandle {
     }
 
     /// Wait for the job to complete
-    pub async fn await(self) -> Result<ProcessingOutput> {
+    pub async fn wait(self) -> Result<ProcessingOutput> {
         self.receiver.await.map_err(|_| EngineError::QueueError {
             message: "Job cancelled".to_string(),
             queue_size: 0,

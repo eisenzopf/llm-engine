@@ -4,11 +4,13 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use anyhow::Result;
 use candle_core::{Device, DType};
+use crate::gpu::GpuAllocation;
 use crate::{
     config::EngineConfig,
     error::{EngineError, ResourceType},
     metrics::MetricsCollector,
 };
+
 
 /// Manages GPU devices and memory allocation
 pub struct GpuManager {
@@ -242,41 +244,37 @@ impl GpuManager {
                 recoverable: false,
             })?;
 
-        // Synchronize device
-        unsafe {
-            candle_core::cuda_backend::cuda::cuStreamSynchronize(0)?;
-            
-            // Clear CUDA cache
-            candle_core::cuda_backend::cuda::cuMemGetInfo(
-                &mut 0 as *mut usize,
-                &mut 0 as *mut usize,
-            )?;
+        if let Device::Cuda(_) = device.device {
+            unsafe {
+                candle_core::backend::cuda::cuStreamSynchronize(0)?;
+                candle_core::backend::cuda::cuMemGetInfo(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )?;
+            }
         }
-
-        // Reset allocation counters
-        *device.allocated_memory.lock().await = 0;
-        *device.last_garbage_collection.lock().await = std::time::Instant::now();
-
-        // Clear allocation records for this device
-        let mut state = self.allocation_state.write().await;
-        state.device_allocations.retain(|a| a.device_id != device_id);
 
         Ok(())
     }
 
     /// Get device memory in bytes
-    fn get_device_memory(device: &Device) -> Option<usize> {
-        unsafe {
-            let mut free = 0;
-            let mut total = 0;
-            if candle_core::cuda_backend::cuda::cuMemGetInfo(
-                &mut free as *mut usize,
-                &mut total as *mut usize,
-            ).is_ok() {
-                Some(total)
-            } else {
-                None
+    pub fn get_device_memory(device: &Device) -> Option<usize> {
+        match device {
+            Device::Cuda(_) => {
+                let mut free = 0;
+                let mut total = 0;
+                unsafe {
+                    if candle_core::backend::cuda::cuMemGetInfo(
+                        &mut free as *mut usize,
+                        &mut total as *mut usize,
+                    ).is_ok() {
+                        Some(total)
+                    } else {
+                        None
+                    }
+                }
             }
+            _ => None
         }
     }
 

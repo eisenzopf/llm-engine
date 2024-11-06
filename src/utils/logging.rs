@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Once;
 use tracing::{Level, Subscriber};
 use tracing_subscriber::{
-    fmt::{format::FmtSpan, time::UtcTime},
+    fmt::{format::FmtSpan, time::SystemTime},
     EnvFilter,
     FmtSubscriber,
 };
@@ -74,7 +74,7 @@ fn setup_logging_internal(config: LogConfig) -> Result<(), String> {
 
     // Add timestamps if enabled
     let subscriber = if config.timestamps {
-        subscriber.with_timer(UtcTime::rfc_3339())
+        subscriber.with_timer(SystemTime::new())
     } else {
         subscriber
     };
@@ -132,15 +132,14 @@ impl<'a> LogEvent<'a> {
         let _guard = span.enter();
 
         for (key, value) in self.fields {
-            tracing::field!(key, %value);
-        }
-
-        match self.level {
-            Level::ERROR => tracing::error!("{}", self.message),
-            Level::WARN => tracing::warn!("{}", self.message),
-            Level::INFO => tracing::info!("{}", self.message),
-            Level::DEBUG => tracing::debug!("{}", self.message),
-            Level::TRACE => tracing::trace!("{}", self.message),
+            // Use regular event macro instead of field macro
+            match self.level {
+                Level::ERROR => tracing::error!(key = %value),
+                Level::WARN => tracing::warn!(key = %value),
+                Level::INFO => tracing::info!(key = %value),
+                Level::DEBUG => tracing::debug!(key = %value),
+                Level::TRACE => tracing::trace!(key = %value),
+            }
         }
     }
 }

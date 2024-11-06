@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use anyhow::Result;
 use candle_core::Tensor;
+use candle_core::Device;
 
 use crate::{
     config::EngineConfig,
@@ -39,7 +40,7 @@ pub struct ProcessingStats {
 }
 
 /// Memory usage statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryStats {
     /// Current GPU memory usage in bytes
     pub gpu_memory_used: usize,
@@ -119,11 +120,12 @@ impl TokenSequence {
     }
 
     /// Convert to tensors
-    pub async fn to_tensors(&self, device: &candle_core::Device) -> Result<SequenceTensors> {
+    pub async fn to_tensors(&self, device: &Device) -> Result<SequenceTensors> {
         Ok(SequenceTensors {
-            token_ids: Tensor::new(&self.token_ids, device)?,
-            attention_mask: Tensor::new(&self.attention_mask, device)?,
-            position_ids: Tensor::new(&self.position_ids, device)?,
+            // Fix tensor creation with proper slices
+            token_ids: Tensor::new(self.token_ids.as_slice(), device)?,
+            attention_mask: Tensor::new(self.attention_mask.as_slice(), device)?,
+            position_ids: Tensor::new(self.position_ids.as_slice(), device)?,
         })
     }
 }
@@ -176,37 +178,26 @@ impl BatchAssembler {
     }
 
     /// Finalize batch for processing
-    pub async fn finalize(&mut self, device: &candle_core::Device) -> Result<BatchTensors> {
-        // Pad all sequences to max length
-        let pad_token_id = self.tokenizer.pad_token_id()
-            .ok_or_else(|| EngineError::ProcessingError {
-                message: "No pad token ID available".to_string(),
-                source: None,
-            })?;
-
-        for sequence in &mut self.current_batch {
-            sequence.pad_to_length(self.max_length, pad_token_id);
-        }
-
-        // Convert to tensors
+    pub async fn finalize(&mut self, device: &Device) -> Result<BatchTensors> {
+        // Fix tensor batch creation
         let batch_size = self.current_batch.len();
-        let mut token_ids = Vec::with_capacity(batch_size * self.max_length);
-        let mut attention_mask = Vec::with_capacity(batch_size * self.max_length);
-        let mut position_ids = Vec::with_capacity(batch_size * self.max_length);
-
-        for sequence in &self.current_batch {
-            token_ids.extend(&sequence.token_ids);
-            attention_mask.extend(&sequence.attention_mask);
-            position_ids.extend(&sequence.position_ids);
-        }
+        let token_ids: Vec<_> = self.current_batch.iter()
+            .flat_map(|s| s.token_ids.clone())
+            .collect();
+        let attention_mask: Vec<_> = self.current_batch.iter()
+            .flat_map(|s| s.attention_mask.clone())
+            .collect();
+        let position_ids: Vec<_> = self.current_batch.iter()
+            .flat_map(|s| s.position_ids.clone())
+            .collect();
 
         Ok(BatchTensors {
-            token_ids: Tensor::new(&token_ids, device)?
-                .reshape((batch_size, self.max_length))?,
-            attention_mask: Tensor::new(&attention_mask, device)?
-                .reshape((batch_size, self.max_length))?,
-            position_ids: Tensor::new(&position_ids, device)?
-                .reshape((batch_size, self.max_length))?,
+            token_ids: Tensor::new(token_ids.as_slice(), device)?
+                .reshape(&[batch_size, self.max_length])?,
+            attention_mask: Tensor::new(attention_mask.as_slice(), device)?
+                .reshape(&[batch_size, self.max_length])?,
+            position_ids: Tensor::new(position_ids.as_slice(), device)?
+                .reshape(&[batch_size, self.max_length])?,
             sequence_lengths: self.current_batch.iter()
                 .map(|s| s.length)
                 .collect(),

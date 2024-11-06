@@ -1,7 +1,8 @@
 //! Common type definitions used throughout the engine
 
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
+se serde::Deserialize;
 
 /// Processing output from the model
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,16 @@ pub struct ProcessingOutput {
     pub tokens: Vec<String>,
     /// Time taken to process
     pub processing_time: Duration,
+}
+
+impl ProcessingOutput {
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            text: error.into(),
+            tokens: Vec::new(),
+            processing_time: Duration::default(),
+        }
+    }
 }
 
 /// Handle for stream processing

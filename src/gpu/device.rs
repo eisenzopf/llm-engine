@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use anyhow::Result;
 use candle_core::{Device, DType, Tensor};
+use std::collections::HashMap;
 
 use crate::error::EngineError;
 use crate::metrics::MetricsCollector;
@@ -141,6 +142,43 @@ impl GpuDevice {
         })
     }
 
+    fn get_total_memory(device: &Device) -> Option<usize> {
+        match device {
+            Device::Cuda(_) => unsafe {
+                let mut free = 0;
+                let mut total = 0;
+                candle_core::cuda_backend::cuda::cuMemGetInfo(
+                    &mut free,
+                    &mut total,
+                ).ok()?;
+                Some(total)
+            },
+            _ => None
+        }
+    }
+
+    pub async fn allocate_tensor<T: candle_core::WithDType>(
+        &self,
+        shape: &[usize],
+        data: &[T],
+        pool_key: Option<String>,
+    ) -> Result<Tensor> {
+        let size = data.len() * std::mem::size_of::<T>();
+        
+        // Try to get from pool first
+        if let Some(ref key) = pool_key {
+            let mut memory = self.memory.lock().await;
+            if let Some(tensor) = memory.tensor_pool.get(shape) {
+                return Ok(tensor);
+            }
+        }
+
+        // Allocate new tensor
+        let tensor = Tensor::new(data, &self.device)?;
+        
+        Ok(tensor)
+    }
+
     /// Detect device capabilities
     fn detect_capabilities(device: &Device) -> Result<DeviceCapabilities> {
         match device {
@@ -194,7 +232,7 @@ impl GpuDevice {
         let size = data.len() * std::mem::size_of::<T>();
         
         // Try to get from pool first
-        if let Some(key) = pool_key {
+        if let Some(ref key) = pool_key {
             let mut memory = self.memory.lock().await;
             if let Some(tensor) = memory.tensor_pool.get(shape) {
                 return Ok(tensor);

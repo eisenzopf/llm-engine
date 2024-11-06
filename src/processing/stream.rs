@@ -3,10 +3,11 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
+use anyhow::Result;
 
 use crate::{
     config::EngineConfig,
-    error::{EngineError, Result},
+    error::EngineError,
     model::{ModelRuntime, LlamaTokenizer},
     metrics::MetricsCollector,
     types::ProcessingOutput,
@@ -90,107 +91,37 @@ impl StreamProcessor {
     }
 
     /// Process stream messages
-    async fn process_stream(
-        stream_id: usize,
+    pub async fn process_stream(
+        &self,
         runtime: Arc<ModelRuntime>,
-        tokenizer: Arc<LlamaTokenizer>,
         mut input_rx: mpsc::Receiver<String>,
         output_tx: mpsc::Sender<ProcessingOutput>,
         metrics: Arc<Mutex<MetricsCollector>>,
-        active_streams: Arc<Mutex<Vec<StreamState>>>,
-        config: Arc<EngineConfig>,
     ) {
-        debug!("Starting stream processor {}", stream_id);
-
         while let Some(input) = input_rx.recv().await {
             let start_time = std::time::Instant::now();
             
-            // Get current state
-            let mut streams = active_streams.lock().await;
-            let state = streams.iter_mut().find(|s| s.id == stream_id)
-                .expect("Stream state not found");
-
-            // Add instruction template if configured
-            let input = if !input.starts_with("### Instruction:") {
-                config.generation.instruction_template.replace("{}", &input)
-            } else {
-                input
-            };
-
-            // Tokenize input
-            let mut input_tokens = match tokenizer.encode(&input, true).await {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    warn!("Tokenization error on stream {}: {:?}", stream_id, e);
-                    if output_tx.send(ProcessingOutput::error(e)).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            // Add context from previous interaction if any
-            if !state.current_context.is_empty() {
-                let context_size = config.model.max_sequence_length / 4;
-                input_tokens.splice(
-                    0..0, 
-                    state.current_context.iter()
-                        .rev()
-                        .take(context_size)
-                        .rev()
-                        .cloned()
-                );
-            }
-
-            // Ensure we don't exceed maximum sequence length
-            if input_tokens.len() > config.model.max_sequence_length {
-                let truncate_len = input_tokens.len() - config.model.max_sequence_length;
-                input_tokens.drain(0..truncate_len);
-            }
-
-            // Process through model
-            match runtime.process_with_tokens(&input_tokens).await {
+            match runtime.process(&input).await {
                 Ok(output) => {
-                    // Update state
-                    state.processed_tokens += output.tokens.len();
-                    state.current_context.extend(&output.tokens);
-
-                    // Trim context if needed
-                    if state.current_context.len() > config.model.max_sequence_length {
-                        let excess = state.current_context.len() - config.model.max_sequence_length;
-                        state.current_context.drain(0..excess);
-                    }
-
                     // Update metrics
-                    {
-                        let mut metrics = metrics.lock().await;
-                        metrics.record_stream_processing(
-                            stream_id,
+                    if let Ok(mut metrics) = metrics.try_lock() {
+                        metrics.record_batch_processing(
+                            1,
                             output.tokens.len(),
                             start_time.elapsed(),
-                        ).await;
+                        );
                     }
 
-                    // Send output
                     if output_tx.send(output).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
-                    warn!("Processing error on stream {}: {:?}", stream_id, e);
-                    if output_tx.send(ProcessingOutput::error(e)).await.is_err() {
+                    if output_tx.send(ProcessingOutput::new_error(&e.to_string())).await.is_err() {
                         break;
                     }
                 }
             }
-        }
-
-        debug!("Stream processor {} shutting down", stream_id);
-
-        // Cleanup stream state
-        let mut streams = active_streams.lock().await;
-        if let Some(index) = streams.iter().position(|s| s.id == stream_id) {
-            streams.remove(index);
         }
     }
 

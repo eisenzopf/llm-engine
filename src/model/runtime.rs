@@ -262,6 +262,51 @@ impl ModelRuntime {
         Ok(outputs)
     }
 
+    // Process a batch with tokens
+    pub async fn process_batch_with_tokens(
+        &self,
+        token_ids: Vec<Vec<u32>>,
+        attention_masks: Vec<Vec<u8>>,
+        sequence_lengths: Vec<usize>,
+    ) -> Result<Vec<ProcessingOutput>> {
+        // Create tensors from raw data
+        let batch_size = token_ids.len();
+        let max_len = token_ids.iter().map(|x| x.len()).max().unwrap_or(0);
+        
+        let token_tensor = Tensor::new(
+            token_ids.iter().flat_map(|x| x.iter()).copied().collect::<Vec<_>>().as_slice(),
+            &self.device
+        )?.reshape(&[batch_size as i64, max_len as i64])?;
+
+        let mask_tensor = Tensor::new(
+            attention_masks.iter().flat_map(|x| x.iter()).copied().collect::<Vec<_>>().as_slice(),
+            &self.device
+        )?.reshape(&[batch_size as i64, max_len as i64])?;
+
+        // Process through model
+        let outputs = self.model.forward_t(
+            &token_tensor,
+            &mask_tensor,
+            &self.generation_config,
+            &mut self.state.lock().await.cache.as_mut().unwrap()
+        )?;
+
+        // Convert outputs to ProcessingOutput structs
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let output_slice = outputs.get(i)?;
+            let tokens = output_slice.to_vec1::<u32>()?;
+            
+            results.push(ProcessingOutput {
+                text: self.tokenizer.decode(&tokens, true)?,
+                tokens: tokens.into_iter().map(|t| t.to_string()).collect(),
+                processing_time: std::time::Instant::now().duration_since(self.start_time),
+            });
+        }
+
+        Ok(results)
+    }
+
     /// Tokenize input text
     fn tokenize(&self, text: &str) -> Result<Tensor> {
         let tokens = self.tokenizer.encode(text, true)

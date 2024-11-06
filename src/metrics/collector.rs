@@ -98,6 +98,48 @@ impl MetricsCollector {
         }
     }
 
+    pub fn record_allocation(&self, size: usize, device_id: usize) {
+        if let Some(stats) = self.device_stats.get(device_id) {
+            let mut stats = stats.write();
+            stats.allocated_memory += size;
+            stats.peak_memory = stats.peak_memory.max(stats.allocated_memory);
+        }
+    }
+
+    pub fn record_deallocation(&self, size: usize, device_id: usize) {
+        if let Some(stats) = self.device_stats.get(device_id) {
+            let mut stats = stats.write();
+            stats.allocated_memory = stats.allocated_memory.saturating_sub(size);
+        }
+    }
+
+    /// Record stream processing
+    pub async fn record_stream_processing(
+        &self,
+        stream_id: usize,
+        tokens: usize,
+        duration: Duration,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.total_tokens += tokens;
+        state.total_processing_time += duration;
+        Ok(())
+    }
+
+    /// Record queue batch processing
+    pub async fn record_queue_batch(
+        &self,
+        batch_size: usize,
+        tokens: usize,
+        duration: Duration,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.total_processed += batch_size;
+        state.total_tokens += tokens;
+        state.batch_processing_times.push(duration);
+        Ok(())
+    }
+
     /// Record batch processing
     pub async fn record_batch_processing(
         &self,
@@ -186,6 +228,13 @@ impl MetricsCollector {
             },
             error_types: state.error_types.clone(),
         }
+    }
+}
+
+// Add proper Default implementation
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self::new(Arc::new(EngineConfig::default()))
     }
 }
 

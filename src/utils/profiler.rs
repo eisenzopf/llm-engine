@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use lazy_static::lazy_static;
+use tokio::time::Duration;
+use tokio::time::Instant;
 
-lazy_static::lazy_static! {
+lazy_static! {
     static ref GLOBAL_PROFILER: Arc<Profiler> = Arc::new(Profiler::new());
 }
 
@@ -119,6 +121,25 @@ impl<'a> Drop for ProfilerGuard<'a> {
         let mut active_spans = self.profiler.active_spans.lock().unwrap();
         if let Some(pos) = active_spans.iter().position(|s| s.name == self.name) {
             active_spans.remove(pos);
+        }
+    }
+}
+
+impl<'a> Drop for ProfilerGuard<'a> {
+    fn drop(&mut self) {
+        let duration = self.start_time.elapsed();
+        
+        // Use parking_lot's mutex API
+        let mut spans = self.profiler.spans.write();
+        if let Some(stats) = spans.get_mut(&self.name) {
+            stats.update(duration);
+        } else {
+            spans.insert(self.name.clone(), SpanStats::new(duration));
+        }
+        
+        let mut active = self.profiler.active_spans.lock();
+        if let Some(pos) = active.iter().position(|s| s.name == self.name) {
+            active.remove(pos);
         }
     }
 }

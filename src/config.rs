@@ -146,7 +146,7 @@ impl ModelConfig {
             vocab_size: self.vocab_size,
             num_key_value_heads: self.num_attention_heads, // Usually same as attention heads
             rope_theta: 10000.0, // Standard value for Llama models
-            use_flash_attention,
+            use_flash_attn,
             max_position_embeddings: self.max_sequence_length,
             max_sequence_length: Some(self.max_sequence_length),
             eos_token_id: Some(candle_transformers::models::llama::LlamaEosToks::Single(2)), // Standard EOS token for Llama

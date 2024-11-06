@@ -1,48 +1,53 @@
+use std::error::Error as StdError;
 use std::fmt;
-use std::error::Error;
 use std::time::Duration;
+use crate::ProcessingMode;
 
-/// Represents all possible errors that can occur in the LLM Engine
+// Add Result type alias
+pub type Result<T> = std::result::Result<T, EngineError>;
+
 #[derive(Debug)]
 pub enum EngineError {
-    /// Errors during engine initialization
     InitializationError {
         message: String,
-        source: Option<Box<dyn Error + Send + Sync>>,
+        source: Option<Box<dyn StdError + Send + Sync>>,
     },
-    
-    /// GPU-related errors
     GPUError {
         device_id: usize,
         message: String,
         recoverable: bool,
     },
-    
-    /// Model loading or processing errors
     ModelError {
         message: String,
-        source: Option<Box<dyn Error + Send + Sync>>,
+        source: Option<Box<dyn StdError + Send + Sync>>,
     },
-    
-    /// Processing timeout errors
     TimeoutError {
         duration: Duration,
         operation: String,
     },
-    
-    /// Resource allocation errors
     ResourceError {
         message: String,
         resource_type: ResourceType,
     },
-    
-    /// Invalid configuration errors
     ConfigurationError {
         message: String,
         parameter: String,
     },
-
-    /// Queue operation errors
+    ProcessingError {
+        message: String,
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    },
+    StreamError {
+        stream_id: usize,
+        message: String,
+    },
+    InvalidMode {
+        expected: ProcessingMode,
+        actual: ProcessingMode,
+    },
+    DeviceError {
+        message: String,
+    },
     QueueError {
         message: String,
         queue_size: usize,
@@ -86,8 +91,8 @@ impl fmt::Display for EngineError {
     }
 }
 
-impl Error for EngineError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl StdError for EngineError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             EngineError::InitializationError { source, .. } => source.as_ref().map(|s| s.as_ref()),
             EngineError::ModelError { source, .. } => source.as_ref().map(|s| s.as_ref()),
