@@ -1,10 +1,9 @@
 use std::fmt;
 use std::sync::Once;
-use tracing::{Level, Subscriber};
+use tracing::{Level};
 use tracing_subscriber::{
-    fmt::{format::FmtSpan, time::SystemTime},
+    fmt::{format::FmtSpan, self},
     EnvFilter,
-    FmtSubscriber,
 };
 
 static INIT: Once = Once::new();
@@ -54,12 +53,10 @@ pub fn setup_logging(config: LogConfig) -> Result<(), String> {
 }
 
 fn setup_logging_internal(config: LogConfig) -> Result<(), String> {
-    // Build filter
     let filter = EnvFilter::from_default_env()
         .add_directive(config.level.into());
 
-    // Build subscriber
-    let subscriber = FmtSubscriber::builder()
+    let subscriber = fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_thread_ids(true)
         .with_thread_names(true)
@@ -72,15 +69,13 @@ fn setup_logging_internal(config: LogConfig) -> Result<(), String> {
             FmtSpan::NONE
         });
 
-    // Add timestamps if enabled
     let subscriber = if config.timestamps {
-        subscriber.with_timer(SystemTime::new())
+        subscriber.with_timer()
     } else {
         subscriber
     };
 
-    // Set up file output if configured
-    let subscriber = if let Some(path) = config.file_path {
+    if let Some(path) = config.file_path {
         use std::fs::OpenOptions;
         let file = OpenOptions::new()
             .create(true)
@@ -89,27 +84,20 @@ fn setup_logging_internal(config: LogConfig) -> Result<(), String> {
             .map_err(|e| format!("Failed to open log file: {}", e))?;
 
         subscriber.with_writer(std::sync::Mutex::new(file))
+            .try_init()
+            .map_err(|e| format!("Failed to set global subscriber: {}", e))?;
     } else {
         subscriber
-    };
-
-    // Initialize subscriber
-    let subscriber = subscriber.build();
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| format!("Failed to set global subscriber: {}", e))?;
+            .try_init()
+            .map_err(|e| format!("Failed to set global subscriber: {}", e))?;
+    }
 
     Ok(())
 }
 
 /// Structured log event
 #[derive(Debug)]
-pub struct LogEvent<'a> {
-    level: Level,
-    message: String,
-    fields: Vec<(&'a str, String)>,
-}
-
-impl<'a> LogEvent<'a> {
+impl LogEvent<'_> {
     pub fn new(level: Level, message: impl Into<String>) -> Self {
         Self {
             level,
@@ -118,7 +106,7 @@ impl<'a> LogEvent<'a> {
         }
     }
 
-    pub fn field(mut self, key: &'a str, value: impl fmt::Display) -> Self {
+    pub fn field(mut self, key: &'static str, value: impl fmt::Display) -> Self {
         self.fields.push((key, value.to_string()));
         self
     }
@@ -132,13 +120,12 @@ impl<'a> LogEvent<'a> {
         let _guard = span.enter();
 
         for (key, value) in self.fields {
-            // Use regular event macro instead of field macro
             match self.level {
-                Level::ERROR => tracing::error!(key = %value),
-                Level::WARN => tracing::warn!(key = %value),
-                Level::INFO => tracing::info!(key = %value),
-                Level::DEBUG => tracing::debug!(key = %value),
-                Level::TRACE => tracing::trace!(key = %value),
+                Level::ERROR => tracing::error!(%key = %value),
+                Level::WARN => tracing::warn!(%key = %value),
+                Level::INFO => tracing::info!(%key = %value),
+                Level::DEBUG => tracing::debug!(%key = %value),
+                Level::TRACE => tracing::trace!(%key = %value),
             }
         }
     }

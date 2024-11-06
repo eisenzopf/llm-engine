@@ -17,7 +17,7 @@ pub use common::{ProcessingStats, MemoryStats, TokenSequence, BatchTensors};
 
 use crate::{
     config::{EngineConfig, ProcessingMode},
-    error::{EngineError, Result},
+    error::{EngineError},
     model::{ModelRuntime, LlamaTokenizer},
     metrics::MetricsCollector,
     types::ProcessingOutput,
@@ -68,15 +68,33 @@ pub struct ProcessingEngine {
 
 #[async_trait]
 impl Processor for BatchProcessor {
+    async fn process(&self, input: String) -> Result<ProcessingOutput> {
+        // Process single input as batch of one
+        let results = self.process_batch(vec![input]).await?;
+        Ok(results.into_iter().next().unwrap())
+    }
+
+    async fn process_many(&self, inputs: Vec<String>) -> Result<Vec<ProcessingOutput>> {
+        self.process_batch(inputs).await
+    }
+
     async fn get_stats(&self) -> ProcessingStats {
-        let stats = self.get_stats().await;
+        let stats = self.get_batch_stats().await;
         ProcessingStats {
             total_sequences: stats.total_sequences,
             total_tokens: stats.total_tokens,
             total_time: stats.uptime,
             tokens_per_second: stats.total_tokens as f32 / stats.uptime.as_secs_f32(),
             memory_stats: Default::default(),
+            batch_stats: Some(stats.clone()),
+            queue_stats: None,
         }
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        // Cleanup resources
+        self.runtime.shutdown().await?;
+        Ok(())
     }
 }
 
@@ -142,12 +160,12 @@ impl ProcessingEngine {
             return Ok(());
         }
 
-        // Shut down current processor
+        // Shutdown current processor
         self.shutdown().await?;
 
         // Switch mode and initialize new processor
         self.mode = mode;
-        self.init_processor();
+        self.init_processor().await?;
 
         Ok(())
     }
@@ -159,26 +177,24 @@ impl ProcessingEngine {
 
     /// Create a new stream handle
     pub async fn create_stream(&self) -> Result<StreamHandle> {
-        self.stream_processor
-            .as_ref()
+        let processor = self.stream_processor.as_ref()
             .ok_or_else(|| EngineError::InvalidMode {
                 expected: ProcessingMode::Streaming,
                 actual: self.mode,
-            })?
-            .create_handle()
-            .await
+            })?;
+            
+        processor.create_handle().await
     }
 
     /// Process a batch of inputs
     pub async fn process_batch(&self, inputs: Vec<String>) -> Result<Vec<ProcessingOutput>> {
-        self.batch_processor
-            .as_ref()
+        let processor = self.batch_processor.as_ref()
             .ok_or_else(|| EngineError::InvalidMode {
                 expected: ProcessingMode::Batch,
                 actual: self.mode,
-            })?
-            .process_batch(inputs)
-            .await
+            })?;
+
+        processor.process_batch(inputs).await
     }
 
     /// Enqueue an input for processing
@@ -187,14 +203,14 @@ impl ProcessingEngine {
         input: String,
         priority: Priority,
     ) -> Result<QueueHandle> {
-        self.queue_processor
-            .as_ref()
+        let processor = self.queue_processor.as_ref()
             .ok_or_else(|| EngineError::InvalidMode {
                 expected: ProcessingMode::Queue,
                 actual: self.mode,
-            })?
-            .enqueue_with_priority(input, priority)
-            .await
+            })?;
+
+        processor.enqueue_with_priority(input, priority).await
+            .map_err(|e| e.into())  // Convert EngineError to anyhow::Error
     }
 
     /// Get comprehensive processing statistics
@@ -231,7 +247,7 @@ impl ProcessingEngine {
         Ok(MemoryStats {
             gpu_memory_used: gpu_stats.memory_used,
             peak_gpu_memory: gpu_stats.peak_memory,
-            token_cache_size: self.tokenizer.get_cache_size().await,
+            token_cache_size: self.tokenizer.get_cache_stats().await.total_entries,
         })
     }
 

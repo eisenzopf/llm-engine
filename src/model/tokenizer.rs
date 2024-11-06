@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use anyhow::Result;
-use tokenizers::{Tokenizer as HfTokenizer, Token};
+use tokenizers::{Tokenizer as HfTokenizer};
 use tokenizers::models::bpe::BPE;
 use std::path::Path;
 use std::collections::HashMap;
@@ -18,6 +18,15 @@ pub struct LlamaTokenizer {
     metadata: TokenizerMetadata,
     /// Token statistics
     stats: Arc<tokio::sync::RwLock<TokenizerStats>>,
+    /// Token cache
+    cache: Arc<tokio::sync::RwLock<TokenCache>>,
+}
+
+#[derive(Debug, Default)]
+struct TokenCache {
+    entries: HashMap<String, Vec<u32>>,
+    total_entries: usize,
+    max_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -97,24 +106,37 @@ impl LlamaTokenizer {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(tokens) = cache.entries.get(text) {
+                return Ok(tokens.clone());
+            }
+        }
+
+        // Encode using tokenizer
         let encoding = self.tokenizer.encode(
             text,
             add_special_tokens,
-        ).map_err(|e| EngineError::ProcessingError {
-            message: format!("Tokenization failed: {}", e),
-            source: None,
-        })?;
+        ).map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
-        let tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let tokens = encoding.get_ids().to_vec();
 
-        // Update statistics
-        let mut stats = self.stats.write().await;
-        stats.total_processed += 1;
-        stats.total_tokens += tokens.len();
-        stats.avg_tokens_per_sequence = stats.total_tokens as f32 / stats.total_processed as f32;
-        
-        for token in &tokens {
-            *stats.token_frequency.entry(*token).or_insert(0) += 1;
+        // Update cache and stats
+        {
+            let mut cache = self.cache.write().await;
+            cache.add_entry(text.to_string(), tokens.clone());
+        }
+
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_processed += 1;
+            stats.total_tokens += tokens.len();
+            stats.avg_tokens_per_sequence = stats.total_tokens as f32 / stats.total_processed as f32;
+            
+            for token in &tokens {
+                *stats.token_frequency.entry(*token).or_insert(0) += 1;
+            }
         }
 
         Ok(tokens)
@@ -128,22 +150,21 @@ impl LlamaTokenizer {
         padding: bool,
     ) -> Result<EncodingBatch> {
         let encodings = self.tokenizer.encode_batch(
-            texts,
+            texts.to_vec(),  // Convert to Vec<String>
             add_special_tokens,
-        ).map_err(|e| EngineError::ProcessingError {
-            message: format!("Batch tokenization failed: {}", e),
-            source: None,
-        })?;
+        ).map_err(|e| anyhow::anyhow!("Batch tokenization failed: {}", e))?;
 
-        let mut max_len = 0;
         let mut token_ids = Vec::with_capacity(texts.len());
         let mut attention_masks = Vec::with_capacity(texts.len());
+        let mut sequence_lengths = Vec::with_capacity(texts.len());
 
+        let mut max_len = 0;
         for encoding in &encodings {
-            let ids = encoding.get_ids();
+            let ids = encoding.get_ids().to_vec();
             max_len = max_len.max(ids.len());
-            token_ids.push(ids.to_vec());
-            attention_masks.push(vec![1u8; ids.len()]);
+            sequence_lengths.push(ids.len());
+            token_ids.push(ids);
+            attention_masks.push(vec![1u8; sequence_lengths.last().unwrap().clone()]);
         }
 
         // Add padding if requested
@@ -165,21 +186,10 @@ impl LlamaTokenizer {
             }
         }
 
-        // Update statistics
-        let mut stats = self.stats.write().await;
-        stats.total_processed += texts.len();
-        for ids in &token_ids {
-            stats.total_tokens += ids.len();
-            for token in ids {
-                *stats.token_frequency.entry(*token).or_insert(0) += 1;
-            }
-        }
-        stats.avg_tokens_per_sequence = stats.total_tokens as f32 / stats.total_processed as f32;
-
         Ok(EncodingBatch {
             token_ids,
             attention_masks,
-            sequence_lengths: encodings.iter().map(|e| e.get_ids().len()).collect(),
+            sequence_lengths,
         })
     }
 
@@ -207,6 +217,15 @@ impl LlamaTokenizer {
             message: format!("Batch decoding failed: {}", e),
             source: None,
         })
+    }
+
+    pub async fn get_cache_stats(&self) -> TokenCacheStats {
+        let cache = self.cache.read().await;
+        TokenCacheStats {
+            total_entries: cache.total_entries,
+            max_entries: cache.max_entries,
+            hit_rate: cache.calculate_hit_rate(),
+        }
     }
 
     /// Get token ID for a string
@@ -241,6 +260,26 @@ impl LlamaTokenizer {
     }
 }
 
+impl TokenCache {
+    fn add_entry(&mut self, key: String, tokens: Vec<u32>) {
+        if self.entries.len() >= self.max_entries {
+            // Remove oldest entry
+            if let Some(k) = self.entries.keys().next().cloned() {
+                self.entries.remove(&k);
+                self.total_entries -= 1;
+            }
+        }
+        
+        self.entries.insert(key, tokens);
+        self.total_entries += 1;
+    }
+
+    fn calculate_hit_rate(&self) -> f32 {
+        // Implement hit rate calculation
+        0.0 // Placeholder
+    }
+}
+
 /// Batch encoding result
 #[derive(Debug, Clone)]
 pub struct EncodingBatch {
@@ -256,6 +295,13 @@ pub struct TokenizerStatsSnapshot {
     pub total_tokens: usize,
     pub avg_tokens_per_sequence: f32,
     pub vocab_coverage: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenCacheStats {
+    pub total_entries: usize,
+    pub max_entries: usize,
+    pub hit_rate: f32,
 }
 
 #[cfg(test)]

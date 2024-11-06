@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex as PLMutex, RwLock};
 use lazy_static::lazy_static;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -38,21 +38,15 @@ impl Profiler {
     pub fn new() -> Self {
         Self {
             spans: RwLock::new(HashMap::new()),
-            active_spans: Mutex::new(Vec::new()),
+            active_spans: PLMutex::new(Vec::new()),
         }
     }
 
-    /// Get the global profiler instance
-    pub fn global() -> Arc<Profiler> {
-        GLOBAL_PROFILER.clone()
-    }
-
-    /// Start a new profiling span
     pub fn start_span(&self, name: impl Into<String>) -> ProfilerGuard {
         let name = name.into();
         let start_time = Instant::now();
         
-        self.active_spans.lock().unwrap().push(ActiveSpan {
+        self.active_spans.lock().push(ActiveSpan {
             name: name.clone(),
             start_time,
         });
@@ -64,25 +58,15 @@ impl Profiler {
         }
     }
 
-    /// Record a completed span
     fn record_span(&self, name: &str, duration: Duration) {
         let mut spans = self.spans.write();
-        let stats = spans.entry(name.to_string()).or_insert_with(|| SpanStats {
-            count: 0,
-            total_time: Duration::default(),
-            min_time: duration,
-            max_time: duration,
-            avg_time: duration,
-        });
-
-        stats.count += 1;
-        stats.total_time += duration;
-        stats.min_time = stats.min_time.min(duration);
-        stats.max_time = stats.max_time.max(duration);
-        stats.avg_time = stats.total_time / stats.count as u32;
+        if let Some(stats) = spans.get_mut(name) {
+            stats.update(duration);
+        } else {
+            spans.insert(name.to_string(), SpanStats::new(duration));
+        }
     }
 
-    /// Get statistics for all spans
     pub fn get_stats(&self) -> HashMap<String, ProfileStats> {
         let spans = self.spans.read();
         spans.iter()
@@ -117,29 +101,9 @@ impl<'a> Drop for ProfilerGuard<'a> {
         let duration = self.start_time.elapsed();
         self.profiler.record_span(&self.name, duration);
         
-        // Remove from active spans
-        let mut active_spans = self.profiler.active_spans.lock().unwrap();
-        if let Some(pos) = active_spans.iter().position(|s| s.name == self.name) {
+        let mut active_spans = self.profiler.active_spans.lock();
+        if let Some(pos) = active_spans.iter().position(|span| span.name == self.name) {
             active_spans.remove(pos);
-        }
-    }
-}
-
-impl<'a> Drop for ProfilerGuard<'a> {
-    fn drop(&mut self) {
-        let duration = self.start_time.elapsed();
-        
-        // Use parking_lot's mutex API
-        let mut spans = self.profiler.spans.write();
-        if let Some(stats) = spans.get_mut(&self.name) {
-            stats.update(duration);
-        } else {
-            spans.insert(self.name.clone(), SpanStats::new(duration));
-        }
-        
-        let mut active = self.profiler.active_spans.lock();
-        if let Some(pos) = active.iter().position(|s| s.name == self.name) {
-            active.remove(pos);
         }
     }
 }
@@ -170,6 +134,7 @@ macro_rules! profile_span {
 }
 
 /// Span for detailed performance profiling
+#[derive(Debug)]
 pub struct ProfileSpan {
     name: String,
     start: Instant,
@@ -185,7 +150,6 @@ struct ProfileEvent {
 }
 
 impl ProfileSpan {
-    /// Create a new profile span
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -194,7 +158,6 @@ impl ProfileSpan {
         }
     }
 
-    /// Record an event with optional data
     pub fn event(&mut self, name: impl Into<String>) -> &mut Self {
         self.events.push(ProfileEvent {
             name: name.into(),
@@ -204,7 +167,6 @@ impl ProfileSpan {
         self
     }
 
-    /// Add data to the last event
     pub fn data(&mut self, key: impl Into<String>, value: impl ToString) -> &mut Self {
         if let Some(event) = self.events.last_mut() {
             event.data.insert(key.into(), value.to_string());
@@ -236,6 +198,28 @@ impl ProfileSpan {
     }
 }
 
+impl SpanStats {
+    fn new(duration: Duration) -> Self {
+        Self {
+            count: 1,
+            total_time: duration,
+            min_time: duration,
+            max_time: duration,
+            avg_time: duration,
+        }
+    }
+
+    fn update(&mut self, duration: Duration) {
+        self.count += 1;
+        self.total_time += duration;
+        self.min_time = self.min_time.min(duration);
+        self.max_time = self.max_time.max(duration);
+        self.avg_time = Duration::from_nanos(
+            (self.total_time.as_nanos() / self.count as u128) as u64
+        );
+    }
+}
+
 /// Timing information for a completed span
 #[derive(Debug)]
 pub struct SpanTiming {
@@ -250,6 +234,13 @@ pub struct EventTiming {
     pub name: String,
     pub duration: Duration,
     pub data: HashMap<String, String>,
+}
+
+#[macro_export]
+macro_rules! profile_span {
+    ($name:expr) => {
+        let _guard = ::profile_span::Profiler::global().start_span($name);
+    };
 }
 
 #[cfg(test)]

@@ -87,14 +87,15 @@ struct QueueWaitRecord {
     timestamp: Instant,
 }
 
-#[derive(Debug, Clone)]
-struct PriorityStats {
-    priority: Priority,
-    total_jobs: usize,
-    completed_jobs: usize,
-    total_tokens: usize,
-    average_wait_time: Duration,
-    max_wait_time: Duration,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PriorityStats {
+    pub priority: Priority,
+    pub total_jobs: usize,
+    pub completed_jobs: usize,
+    pub total_tokens: usize,
+    pub average_wait_time: Duration,
+    pub max_wait_time: Duration,
+    pub average_processing_time: Duration,
 }
 
 impl Default for PriorityStats {
@@ -360,6 +361,106 @@ impl QueueProcessor {
         }
     }
 
+    async fn process_batch_with_tokens(
+        &self,
+        runtime: Arc<ModelRuntime>,
+        token_ids: Vec<Vec<u32>>,
+        attention_masks: Vec<Vec<u8>>,
+        sequence_lengths: Vec<usize>,
+    ) -> Result<Vec<ProcessingOutput>> {
+        // Process through model
+        match runtime.process_batch_with_tokens(
+            token_ids,
+            attention_masks.clone(),
+            sequence_lengths.clone(),
+        ).await {
+            Ok(outputs) => {
+                let mut stats = self.stats.write().await;
+                stats.completed_jobs += outputs.len();
+
+                for output in &outputs {
+                    if let Some(priority_stats) = stats.priority_stats.iter_mut()
+                        .find(|s| s.priority == Priority::Medium)  // Default priority for now
+                    {
+                        priority_stats.completed_jobs += 1;
+                        priority_stats.total_tokens += output.tokens.len();
+                        priority_stats.average_processing_time = 
+                            calculate_average_duration(
+                                priority_stats.average_processing_time,
+                                output.processing_time,
+                                priority_stats.completed_jobs
+                            );
+                    }
+                }
+
+                Ok(outputs)
+            }
+            Err(e) => {
+                let mut stats = self.stats.write().await;
+                stats.failed_jobs += token_ids.len();
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn process_queue_batch(&self) -> Result<()> {
+        let mut jobs = Vec::new();
+        
+        // Collect jobs to process
+        {
+            let mut queue = self.queue.lock().await;
+            while let Some(job) = queue.pop() {
+                jobs.push(job);
+                if jobs.len() >= self.config.processing.batch_size.unwrap_or(32) {
+                    break;
+                }
+            }
+        }
+
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-tokenize inputs
+        let inputs: Vec<String> = jobs.iter().map(|j| j.input.clone()).collect();
+        let encoding_result = self.tokenizer.encode_batch(
+            &inputs,
+            true,
+            true,
+        ).await?;
+
+        // Process batch
+        let results = self.process_batch_with_tokens(
+            self.runtime.clone(),
+            encoding_result.token_ids,
+            encoding_result.attention_masks,
+            encoding_result.sequence_lengths,
+        ).await?;
+
+        // Send results
+        for (job, result) in jobs.into_iter().zip(results.into_iter()) {
+            let wait_time = job.enqueued_at.elapsed();
+            
+            // Update wait time statistics
+            let mut stats = self.stats.write().await;
+            if let Some(priority_stats) = stats.priority_stats.iter_mut()
+                .find(|s| s.priority == job.priority)
+            {
+                priority_stats.average_wait_time = calculate_average_duration(
+                    priority_stats.average_wait_time,
+                    wait_time,
+                    priority_stats.completed_jobs
+                );
+                priority_stats.max_wait_time = priority_stats.max_wait_time.max(wait_time);
+            }
+
+            // Send result
+            let _ = job.response_sender.send(Ok(result));
+        }
+
+        Ok(())
+    }
+
     /// Get current queue size
     pub async fn queue_size(&self) -> usize {
         let queue = self.queue.lock().await;
@@ -432,6 +533,30 @@ impl QueueHandle {
             message: "Job cancelled".to_string(),
             queue_size: 0,
         })?
+    }
+}
+
+// Helper function for duration averaging
+fn calculate_average_duration(current_avg: Duration, new_value: Duration, count: usize) -> Duration {
+    if count <= 1 {
+        new_value
+    } else {
+        let total_nanos = current_avg.as_nanos() * (count as u128 - 1) + new_value.as_nanos();
+        Duration::from_nanos((total_nanos / count as u128) as u64)
+    }
+}
+
+// Add missing Default implementation for required types
+impl Default for QueueStats {
+    fn default() -> Self {
+        Self {
+            total_jobs: 0,
+            completed_jobs: 0,
+            failed_jobs: 0,
+            total_processing_time: Duration::default(),
+            queue_wait_times: Vec::new(),
+            priority_stats: Vec::new(),
+        }
     }
 }
 

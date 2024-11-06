@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use anyhow::Result;
-use candle_core::{Device, DType, Tensor};
+use candle_core::{Device, Tensor, DType}; 
 use std::collections::HashMap;
 
 use crate::error::EngineError;
@@ -114,14 +114,16 @@ impl GpuDevice {
     /// Create a new GPU device
     pub async fn new(
         index: usize,
-        device: Device,
+        device: Device,  
         metrics_collector: Arc<Mutex<MetricsCollector>>,
     ) -> Result<Self> {
         let capabilities = Self::detect_capabilities(&device)?;
-        let total_memory = Self::get_total_memory(&device)?;
-        
+        // Convert Option to Result with error
+        let total_memory = Self::get_total_memory(&device)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get device memory"))?;
+
         let memory = DeviceMemory {
-            total_bytes: total_memory,
+            total_bytes: total_memory as u64,  // Convert to u64
             allocated_bytes: 0,
             peak_bytes: 0,
             allocations: Vec::new(),
@@ -129,7 +131,7 @@ impl GpuDevice {
             tensor_pool: TensorPool {
                 tensors: HashMap::new(),
                 total_bytes: 0,
-                max_pool_bytes: total_memory / 4, // Use up to 25% for pool
+                max_pool_bytes: (total_memory as u64) / 4,  // Convert to u64
             },
         };
 
@@ -155,28 +157,6 @@ impl GpuDevice {
             },
             _ => None
         }
-    }
-
-    pub async fn allocate_tensor<T: candle_core::WithDType>(
-        &self,
-        shape: &[usize],
-        data: &[T],
-        pool_key: Option<String>,
-    ) -> Result<Tensor> {
-        let size = data.len() * std::mem::size_of::<T>();
-        
-        // Try to get from pool first
-        if let Some(ref key) = pool_key {
-            let mut memory = self.memory.lock().await;
-            if let Some(tensor) = memory.tensor_pool.get(shape) {
-                return Ok(tensor);
-            }
-        }
-
-        // Allocate new tensor
-        let tensor = Tensor::new(data, &self.device)?;
-        
-        Ok(tensor)
     }
 
     /// Detect device capabilities
@@ -231,8 +211,8 @@ impl GpuDevice {
     ) -> Result<Tensor> {
         let size = data.len() * std::mem::size_of::<T>();
         
-        // Try to get from pool first
-        if let Some(ref key) = pool_key {
+        // Try pool first
+        if let Some(key) = pool_key.as_ref() {
             let mut memory = self.memory.lock().await;
             if let Some(tensor) = memory.tensor_pool.get(shape) {
                 return Ok(tensor);
@@ -244,15 +224,7 @@ impl GpuDevice {
         
         // Track allocation
         let mut memory = self.memory.lock().await;
-        memory.allocated_bytes += size as u64;
-        memory.peak_bytes = memory.peak_bytes.max(memory.allocated_bytes);
-        
-        memory.allocations.push(MemoryAllocation {
-            size: size as u64,
-            timestamp: Instant::now(),
-            purpose: pool_key.unwrap_or_else(|| "unknown".to_string()),
-            stack_trace: std::backtrace::Backtrace::force_capture().to_string(),
-        });
+        memory.record_allocation(size as u64, pool_key);
 
         Ok(tensor)
     }
@@ -335,19 +307,13 @@ impl TensorPool {
     }
 
     /// Add a tensor to the pool
-    fn add(&mut self, tensor: Tensor, key: &str) -> Result<()> {
+    pub fn add(&mut self, tensor: Tensor, key: &str) -> Result<()> {
         let shape = tensor.dims().to_vec();
-        let size = tensor.elem_size()? * shape.iter().product::<usize>() as u64;
+        let size = tensor.bytes()? as u64;  // Replace elem_size with bytes
         
-        // Check if adding would exceed pool limit
+        // Check pool limit
         if self.total_bytes + size > self.max_pool_bytes {
-            // Remove oldest tensors until we have space
-            for tensors in self.tensors.values_mut() {
-                while !tensors.is_empty() && self.total_bytes + size > self.max_pool_bytes {
-                    tensors.remove(0);
-                    self.total_bytes -= size;
-                }
-            }
+            self.cleanup(size)?;
         }
 
         self.tensors.entry(shape).or_default().push(tensor);
@@ -359,6 +325,33 @@ impl TensorPool {
     fn clear(&mut self) {
         self.tensors.clear();
         self.total_bytes = 0;
+    }
+
+    /// Clean up the pool
+    fn cleanup(&mut self, needed_size: u64) -> Result<()> {
+        while self.total_bytes + needed_size > self.max_pool_bytes && !self.tensors.is_empty() {
+            // Remove oldest tensors
+            if let Some((_, tensors)) = self.tensors.iter_mut().next() {
+                if let Some(tensor) = tensors.pop() {
+                    self.total_bytes -= tensor.bytes()? as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DeviceMemory {
+    fn record_allocation(&mut self, size: u64, purpose: Option<String>) {
+        self.allocated_bytes += size;
+        self.peak_bytes = self.peak_bytes.max(self.allocated_bytes);
+        
+        self.allocations.push(MemoryAllocation {
+            size,
+            timestamp: Instant::now(),
+            purpose: purpose.unwrap_or_else(|| "unknown".to_string()),
+            stack_trace: std::backtrace::Backtrace::force_capture().to_string(),
+        });
     }
 }
 

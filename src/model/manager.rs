@@ -4,11 +4,11 @@ use anyhow::Result;
 use dashmap::DashMap;
 
 use crate::{
-    config::{EngineConfig, ProcessingMode},
+    config::EngineConfig,
     error::EngineError,
     gpu::GpuManager,
     metrics::MetricsCollector,
-    types::{ProcessingOutput, StreamHandle, QueueHandle},
+    processing::{ProcessingOutput, StreamHandle, QueueHandle},
 };
 
 use super::{
@@ -55,6 +55,14 @@ struct BatchInProgress {
     response_senders: Vec<tokio::sync::oneshot::Sender<Result<ProcessingOutput>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub device_id: usize,
+    pub model_type: String,
+    pub parameters: usize,
+    pub max_sequence_length: usize,
+}
+
 impl ModelManager {
     /// Create a new model manager
     pub async fn new(
@@ -63,7 +71,7 @@ impl ModelManager {
     ) -> Result<Self> {
         let metrics = Arc::new(Mutex::new(MetricsCollector::new(config.clone())));
         let loader = Arc::new(ModelLoader::new(config.clone()));
-        
+
         let manager = Self {
             config: config.clone(),
             gpu_manager,
@@ -74,7 +82,7 @@ impl ModelManager {
             next_job_id: Arc::new(Mutex::new(0)),
         };
 
-        // Initialize processing queues for each GPU
+        // Initialize queues for each GPU
         let mut queues = manager.processing_queues.write().await;
         for device_id in 0..manager.gpu_manager.available_gpus() {
             queues.push(ProcessingQueue {
@@ -85,19 +93,36 @@ impl ModelManager {
         }
 
         // Load models based on processing mode
-        match config.processing.mode {
-            ProcessingMode::Streaming => {
-                manager.initialize_streaming_mode().await?;
-            }
-            ProcessingMode::Batch => {
-                manager.initialize_batch_mode().await?;
-            }
-            ProcessingMode::Queue => {
-                manager.initialize_queue_mode().await?;
-            }
-        }
+        manager.initialize_models().await?;
 
         Ok(manager)
+    }
+
+    async fn initialize_models(&self) -> Result<()> {
+        let available_gpus = self.gpu_manager.available_gpus();
+        let mut handles = Vec::new();
+
+        for device_id in 0..available_gpus {
+            let config = self.config.clone();
+            let loader = self.loader.clone();
+            let metrics = self.metrics.clone();
+
+            let handle = tokio::spawn(async move {
+                let runtime = loader.load_model(device_id).await?;
+                Ok::<_, anyhow::Error>((device_id, Arc::new(runtime)))
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (device_id, runtime) = handle.await.map_err(|e| EngineError::InitializationError {
+                message: format!("Failed to join model loading task: {}", e),
+                source: None,
+            })??;
+            self.runtimes.insert(device_id, runtime);
+        }
+
+        Ok(())
     }
 
     /// Initialize streaming mode
@@ -138,13 +163,6 @@ impl ModelManager {
 
     /// Create stream handles for processing
     pub async fn create_stream_handles(&self) -> Result<Vec<StreamHandle>> {
-        if self.config.processing.mode != ProcessingMode::Streaming {
-            return Err(EngineError::ConfigurationError { 
-                message: "Not configured for streaming mode".to_string(),
-                parameter: "mode".to_string(),
-            }.into());
-        }
-
         let mut handles = Vec::new();
         for device_id in 0..self.gpu_manager.available_gpus() {
             let runtime = self.runtimes.get(&device_id)
@@ -159,6 +177,7 @@ impl ModelManager {
             // Spawn processing task
             let runtime = runtime.clone();
             let metrics = self.metrics.clone();
+
             tokio::spawn(async move {
                 self.process_stream(runtime, input_rx, output_tx, metrics).await;
             });
@@ -252,22 +271,34 @@ impl ModelManager {
 
     /// Stream processing loop
     async fn process_stream(
-        &self,
         runtime: Arc<ModelRuntime>,
         mut input_rx: tokio::sync::mpsc::Receiver<String>,
         output_tx: tokio::sync::mpsc::Sender<ProcessingOutput>,
         metrics: Arc<Mutex<MetricsCollector>>,
     ) {
         while let Some(input) = input_rx.recv().await {
+            let start_time = std::time::Instant::now();
             match runtime.process(input).await {
                 Ok(output) => {
+                    // Update metrics
+                    if let Ok(mut metrics) = metrics.try_lock() {
+                        metrics.record_stream_processing(
+                            output.tokens.len(),
+                            start_time.elapsed(),
+                        ).await.ok();
+                    }
+
                     if output_tx.send(output).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
-                    // Log error and continue
                     tracing::error!("Processing error: {:?}", e);
+                    // Send error output
+                    let error_output = ProcessingOutput::error(e.to_string());
+                    if output_tx.send(error_output).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -275,11 +306,10 @@ impl ModelManager {
 
     /// Shutdown and cleanup
     pub async fn shutdown(&self) -> Result<()> {
-        // Cleanup runtimes
+        // Shutdown all runtimes
         for runtime in self.runtimes.iter() {
             runtime.value().shutdown().await?;
         }
-
         Ok(())
     }
 }

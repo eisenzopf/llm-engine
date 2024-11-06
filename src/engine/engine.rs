@@ -9,6 +9,17 @@ use crate::{
     types::{ProcessingOutput, StreamHandle, QueueHandle},
 };
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::{
+    config::{EngineConfig, ProcessingMode},
+    error::{EngineError, Result},
+    gpu::GpuManager,
+    model::ModelManager,
+    metrics::{MetricsCollector, MetricsSnapshot},
+    processing::{ProcessingOutput, StreamHandle, QueueHandle},
+};
+
 /// Main entry point for the LLM Engine library
 pub struct LLMEngine {
     config: Arc<EngineConfig>,
@@ -47,28 +58,29 @@ impl EngineBuilder {
         // Validate configuration
         self.config.validate()?;
 
-        // Initialize components
-        let config = Arc::new(self.config);
-        let metrics = Arc::new(Mutex::new(MetricsCollector::new(config.clone())));
-        
-        // Initialize GPU manager
-        let gpu_manager = GpuManager::new(config.clone(), metrics.clone()).await
+        // Initialize components 
+        let metrics = Arc::new(Mutex::new(MetricsCollector::new(self.config.clone())));
+
+        // Fix error conversion in GPU manager initialization
+        let gpu_manager = GpuManager::new(self.config.clone(), metrics.clone())
+            .await
             .map_err(|e| EngineError::InitializationError {
                 message: "Failed to initialize GPU manager".to_string(),
                 source: Some(Box::new(e)),
             })?;
         let gpu_manager = Arc::new(gpu_manager);
 
-        // Initialize model manager
-        let model_manager = ModelManager::new(config.clone(), gpu_manager.clone()).await
+        // Fix error conversion in model manager initialization  
+        let model_manager = ModelManager::new(self.config.clone(), gpu_manager.clone())
+            .await
             .map_err(|e| EngineError::InitializationError {
-                message: "Failed to initialize model manager".to_string(),
+                message: "Failed to initialize model manager".to_string(), 
                 source: Some(Box::new(e)),
             })?;
         let model_manager = Arc::new(model_manager);
 
         Ok(LLMEngine {
-            config,
+            config: self.config,
             gpu_manager,
             model_manager,
             metrics,
@@ -131,13 +143,22 @@ impl LLMEngine {
     /// Get the current metrics
     pub async fn get_metrics(&self) -> Result<MetricsSnapshot> {
         let metrics = self.metrics.lock().await;
-        metrics.snapshot()
+        Ok(metrics.snapshot().await)
     }
 
     /// Shutdown the engine and release resources
     pub async fn shutdown(self) -> Result<()> {
-        self.model_manager.shutdown().await?;
-        self.gpu_manager.shutdown().await?;
+        // Convert error types properly
+        self.model_manager.shutdown().await.map_err(|e| EngineError::InitializationError {
+            message: "Failed to shutdown model manager".to_string(),
+            source: Some(Box::new(e)), 
+        })?;
+        
+        self.gpu_manager.shutdown().await.map_err(|e| EngineError::InitializationError {  
+            message: "Failed to shutdown GPU manager".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+
         Ok(())
     }
 }

@@ -94,9 +94,11 @@ impl fmt::Display for EngineError {
 impl StdError for EngineError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            EngineError::InitializationError { source, .. } => source.as_ref().map(|s| s.as_ref()),
-            EngineError::ModelError { source, .. } => source.as_ref().map(|s| s.as_ref()),
-            _ => None,
+            EngineError::InitializationError { source, .. } => 
+                source.as_ref().map(|s| &**s as &(dyn StdError + 'static)),
+            EngineError::ModelError { source, .. } => 
+                source.as_ref().map(|s| &**s as &(dyn StdError + 'static)),
+            _ => None
         }
     }
 }
@@ -113,15 +115,18 @@ impl ErrorExt for EngineError {
             EngineError::GPUError { recoverable, .. } => *recoverable,
             EngineError::TimeoutError { .. } => true,
             EngineError::ResourceError { resource_type: ResourceType::Memory, .. } => true,
-            _ => false,
+            EngineError::ProcessingError { .. } => false,
+            EngineError::StreamError { .. } => false,
+            EngineError::InvalidMode { .. } => false,
+            EngineError::DeviceError { .. } => false,
+            _ => false
         }
     }
 
     fn should_reduce_batch(&self) -> bool {
         matches!(self,
-            EngineError::GPUError { message, .. } if message.contains("out of memory") ||
-            EngineError::ResourceError { resource_type: ResourceType::Memory, .. }
-        )
+            EngineError::GPUError { message, .. } if message.contains("out of memory") | 
+            EngineError::ResourceError { resource_type: ResourceType::Memory, message: _ })
     }
 }
 

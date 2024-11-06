@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use crate::config::EngineConfig;
+use anyhow::Result;
 
 /// Collects and manages performance metrics
 pub struct MetricsCollector {
@@ -80,11 +81,14 @@ impl MetricsCollector {
     }
 
     /// Record GPU memory allocation
-    pub fn record_gpu_allocation(&mut self, device_id: usize, bytes: usize) {
-        if let Ok(mut state) = self.state.try_write() {
-            if device_id < state.gpu_memory_allocated.len() {
-                state.gpu_memory_allocated[device_id] += bytes;
-            }
+    pub async fn record_gpu_allocation(
+        &self,
+        device_id: usize,
+        bytes: usize,
+    ) {
+        let mut state = self.state.write().await;
+        if device_id < state.gpu_memory_allocated.len() {
+            state.gpu_memory_allocated[device_id] += bytes;
         }
     }
 
@@ -146,7 +150,7 @@ impl MetricsCollector {
         size: usize,
         tokens: usize,
         duration: Duration,
-    ) {
+    ) -> Result<()> {
         let mut state = self.state.write().await;
         
         state.total_processed += size;
@@ -166,6 +170,8 @@ impl MetricsCollector {
             state.batch_processing_times.remove(0);
             state.tokens_per_second.remove(0);
         }
+
+        Ok(())
     }
 
     /// Record an error
@@ -186,30 +192,6 @@ impl MetricsCollector {
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let state = self.state.read().await;
         
-        // Calculate average tokens per second
-        let average_tps = if !state.tokens_per_second.is_empty() {
-            state.tokens_per_second.iter().sum::<f32>() / state.tokens_per_second.len() as f32
-        } else {
-            0.0
-        };
-
-        // Calculate latency percentiles
-        let mut latencies = state.batch_processing_times.clone();
-        latencies.sort();
-        
-        let p95_idx = (latencies.len() as f32 * 0.95) as usize;
-        let p99_idx = (latencies.len() as f32 * 0.99) as usize;
-        
-        let average_latency = if !latencies.is_empty() {
-            Duration::from_secs_f32(
-                latencies.iter()
-                    .map(|d| d.as_secs_f32())
-                    .sum::<f32>() / latencies.len() as f32
-            )
-        } else {
-            Duration::default()
-        };
-
         MetricsSnapshot {
             timestamp: Instant::now(),
             uptime: self.start_time.elapsed(),
@@ -217,10 +199,10 @@ impl MetricsCollector {
             gpu_utilization: state.gpu_utilization.clone(),
             total_processed: state.total_processed,
             total_tokens: state.total_tokens,
-            average_tokens_per_second: average_tps,
-            average_latency,
-            p95_latency: latencies.get(p95_idx).copied().unwrap_or_default(),
-            p99_latency: latencies.get(p99_idx).copied().unwrap_or_default(),
+            average_tokens_per_second: calculate_average(&state.tokens_per_second),
+            average_latency: calculate_average_duration(&state.batch_processing_times),
+            p95_latency: calculate_percentile(&state.batch_processing_times, 0.95),
+            p99_latency: calculate_percentile(&state.batch_processing_times, 0.99),
             error_rate: if state.total_processed > 0 {
                 state.total_errors as f32 / state.total_processed as f32
             } else {
@@ -236,6 +218,39 @@ impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new(Arc::new(EngineConfig::default()))
     }
+}
+
+// Helper functions
+fn calculate_average(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f32>() / values.len() as f32
+    }
+}
+
+fn calculate_average_duration(durations: &[Duration]) -> Duration {
+    if durations.is_empty() {
+        Duration::default()
+    } else {
+        Duration::from_secs_f64(
+            durations.iter()
+                .map(|d| d.as_secs_f64())
+                .sum::<f64>() / durations.len() as f64
+        )
+    }
+}
+
+fn calculate_percentile(durations: &[Duration], percentile: f32) -> Duration {
+    if durations.is_empty() {
+        return Duration::default();
+    }
+    
+    let mut sorted: Vec<_> = durations.to_vec();
+    sorted.sort();
+    
+    let index = ((sorted.len() as f32 - 1.0) * percentile).round() as usize;
+    sorted[index]
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Common processing statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessingStats {
     /// Number of sequences processed
     pub total_sequences: usize,

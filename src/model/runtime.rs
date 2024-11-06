@@ -8,11 +8,13 @@ use tokenizers::Tokenizer;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use candle_transformers::generation::LogitsProcessor;
+use crate::processing::ProcessingOutput;
+
 use crate::{
     config::EngineConfig,
     error::EngineError,
     gpu_utils::GpuMonitor,
-    types::ProcessingOutput,
 };
 
 pub struct ModelRuntime {
@@ -87,95 +89,33 @@ impl ModelRuntime {
         let start_time = std::time::Instant::now();
 
         // Get or create cache
-        let mut state = self.state.lock().await;
-        if state.cache.is_none() {
-            state.cache = Some(Cache::new(
-                true, // Always use KV cache for single inputs
+        let mut cache = self.state.lock().await;
+        if cache.cache.is_none() {
+            cache.cache = Some(Cache::new(
+                true,
                 DType::BF16,
                 &self.config,
                 &self.device,
             )?);
         }
-        let cache = state.cache.as_mut().unwrap();
-
-        // Tokenize input
-        let tokens = self.tokenize(&input)?;
-        let input_tensor = tokens.to_device(&self.device)?;
         
-        // Initialize generation
-        let mut generated_tokens = vec![];
-        let mut current_token = input_tensor;
-        let mut index_pos = 0;
+        // Process with proper error conversion
+        let result = self.process_internal(
+            input,
+            cache.cache.as_mut().unwrap(),
+            start_time,
+        ).await;
 
-        // Create logits processor
-        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(
-            299792458, // Seed
-            self.generation_config.temperature,
-            Some(self.generation_config.top_p),
-        );
-
-        // Generate tokens
-        for _ in 0..self.generation_config.max_tokens {
-            let (context_size, position) = if index_pos > 0 {
-                (1, tokens.len() + index_pos - 1)
-            } else {
-                (current_token.dims()[0], 0)
-            };
-
-            // Forward pass
-            let logits = self.model.forward(&current_token, position, cache)?;
-            let logits = logits.to_dtype(DType::F32)?;
-            
-            // Apply repetition penalty if needed
-            let logits = if self.generation_config.repetition_penalty != 1.0 {
-                let start_at = generated_tokens.len()
-                    .saturating_sub(self.generation_config.repetition_context_size);
-                candle_transformers::utils::apply_repeat_penalty(
-                    &logits,
-                    self.generation_config.repetition_penalty,
-                    &generated_tokens[start_at..],
-                )?
-            } else {
-                logits
-            };
-
-            // Sample next token
-            let next_token = logits_processor.sample(&logits)?;
-            generated_tokens.push(next_token);
-
-            // Check for EOS token
-            if let Some(eos_token) = &self.config.eos_token_id {
-                match eos_token {
-                    LlamaEosToks::Single(token) if *token == next_token => break,
-                    LlamaEosToks::Multiple(tokens) if tokens.contains(&next_token) => break,
-                    _ => {}
-                }
-            }
-
-            // Prepare next iteration
-            current_token = Tensor::new(&[next_token], &self.device)?;
-            index_pos += context_size;
+        // Update metrics regardless of success/failure
+        if let Ok(ref output) = result {
+            let mut metrics = self.metrics.lock().await;
+            metrics.record_processing(
+                output.tokens.len(),
+                start_time.elapsed(),
+            ).await?;
         }
 
-        // Decode generated tokens
-        let output_text = self.decode(&generated_tokens)?;
-
-        // Update state
-        let processing_time = start_time.elapsed();
-        state.total_processed += 1;
-        state.total_tokens_generated += generated_tokens.len();
-        state.last_processing_time = Some(processing_time);
-
-        // Update peak memory
-        if let Some(mem_used) = self.gpu_monitor.get_memory_used().await? {
-            state.peak_memory_usage = state.peak_memory_usage.max(mem_used);
-        }
-
-        Ok(ProcessingOutput {
-            text: output_text,
-            tokens: generated_tokens,
-            processing_time,
-        })
+        result
     }
 
     /// Process a batch of inputs
@@ -334,11 +274,13 @@ impl ModelRuntime {
 
     /// Decode tokens to text
     fn decode(&self, tokens: &[usize]) -> Result<String> {
-        self.tokenizer.decode(tokens, true)
-            .map_err(|e| EngineError::ProcessingError {
-                message: format!("Decoding failed: {}", e),
-                source: None,
-            })
+        // Convert usize tokens to u32 for tokenizer
+        let u32_tokens: Vec<u32> = tokens.iter()
+            .map(|&t| t as u32)
+            .collect();
+
+        self.tokenizer.decode(&u32_tokens, true)
+            .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))
     }
 
     /// Get runtime statistics
