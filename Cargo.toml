@@ -1,0 +1,68 @@
+[package]
+name = "llm-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High performance GPU-accelerated language model processing engine"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/llm-engine"
+documentation = "https://docs.rs/llm-engine"
+readme = "README.md"
+keywords = ["llm", "gpu", "machine-learning", "inference"]
+categories = ["science::ml"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# GPU and ML dependencies
+candle-core = { version = "0.7.2", features = ["cuda"] }
+candle-nn = { version = "0.7.2", features = ["cuda"] }
+tokenizers = "0.15"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+async-trait = "0.1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+dashmap = "5.5"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.5"
+tempfile = "3.8"
+pretty_assertions = "1.4"
+
+[features]
+default = ["cuda"]
+cuda = []
+cpu = []
+
+[[example]]
+name = "simple_stream"
+path = "examples/simple_stream.rs"
+
+[[example]]
+name = "batch_processing"
+path = "examples/batch_processing.rs"
+
+[[example]]
+name = "queue_processing"
+path = "examples/queue_processing.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
